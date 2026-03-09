@@ -11,7 +11,7 @@ import yaml
 import requests
 import librouteros
 from librouteros.exceptions import TrapError, FatalError
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 
 # Suppress InsecureRequestWarning for self-signed OPNsense certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -24,9 +24,11 @@ device_details = {}   # {device_id: {cpu, ram, uptime, ...}}
 device_ping    = {}   # {device_id: {primary: {ip, reachable, latency}, alt?: ...}}
 config         = {}   # full parsed config.yaml content
 
-# Populated from config.yaml credentials.mikrotik_monitor at startup
-MIKROTIK_USER = ""
-MIKROTIK_PASS = ""
+# Populated from config.yaml credentials at startup
+MIKROTIK_USER       = ""   # read-only monitor account
+MIKROTIK_PASS       = ""
+MIKROTIK_WRITE_USER = ""   # write account for interface toggles
+MIKROTIK_WRITE_PASS = ""
 
 # How long (seconds) to wait for MikroTik / OPNsense API responses
 API_TIMEOUT      = 8
@@ -43,7 +45,7 @@ MIKROTIK_PHYS_TYPES = {'ether', 'sfp', 'sfp-sfpplus', 'sfpplus', 'combo'}
 
 def load_config():
     """Read config.yaml and populate global config and credential variables."""
-    global config, MIKROTIK_USER, MIKROTIK_PASS
+    global config, MIKROTIK_USER, MIKROTIK_PASS, MIKROTIK_WRITE_USER, MIKROTIK_WRITE_PASS
     with open('config.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
@@ -52,6 +54,10 @@ def load_config():
     mon = config.get('credentials', {}).get('mikrotik_monitor', {})
     MIKROTIK_USER = mon.get('user', 'monitor')
     MIKROTIK_PASS = mon.get('password', 'monitor')
+
+    wr = config.get('credentials', {}).get('mikrotik_write', {})
+    MIKROTIK_WRITE_USER = wr.get('user', '')
+    MIKROTIK_WRITE_PASS = wr.get('password', '')
 
 
 # =============================================================================
@@ -644,6 +650,87 @@ def get_details():
 def get_ping():
     """Return ping results (IP, reachability, latency) for all devices as JSON."""
     return jsonify(device_ping)
+
+
+@app.route('/api/interface/toggle', methods=['POST'])
+def toggle_interface():
+    """
+    Toggle the disabled state of a physical Ethernet interface on a MikroTik device.
+
+    Request JSON:
+        device_id  – device id as defined in config.yaml
+        interface  – interface name (e.g. 'ether9')
+
+    Response JSON:
+        { "disabled": <bool>, "interface": <name> }   on success
+        { "error": <message> }                         on failure
+
+    Requires credentials.mikrotik_write in config.yaml.
+    Only ethernet-type interfaces may be toggled (safety guard).
+    """
+    if not MIKROTIK_WRITE_USER:
+        return jsonify({'error': 'No write account configured (credentials.mikrotik_write missing)'}), 503
+
+    body       = request.get_json(force=True) or {}
+    dev_id     = body.get('device_id', '').strip()
+    iface_name = body.get('interface', '').strip()
+
+    if not dev_id or not iface_name:
+        return jsonify({'error': 'device_id and interface are required'}), 400
+
+    # Look up device
+    dev = next((
+        d for layer in config['devices'].values()
+        for d in layer
+        if d.get('id') == dev_id and d.get('type') == 'mikrotik'
+    ), None)
+    if not dev:
+        return jsonify({'error': f'MikroTik device "{dev_id}" not found'}), 404
+
+    try:
+        api = librouteros.connect(
+            dev['ip'],
+            username=MIKROTIK_WRITE_USER,
+            password=MIKROTIK_WRITE_PASS,
+            port=8728,
+            timeout=API_TIMEOUT,
+        )
+
+        # Find the interface and verify it is an ethernet type (safety guard)
+        target = None
+        for iface in api.path('interface'):
+            if iface.get('name') == iface_name:
+                target = iface
+                break
+
+        if target is None:
+            api.close()
+            return jsonify({'error': f'Interface "{iface_name}" not found on {dev_id}'}), 404
+
+        # Only allow toggling physical ethernet interfaces
+        allowed_types = {'ether', 'sfp', 'sfp-sfpplus', 'sfpplus', 'combo'}
+        if target.get('type', '') not in allowed_types:
+            api.close()
+            return jsonify({'error': f'Interface "{iface_name}" is not an Ethernet interface (type: {target.get("type")})'}), 400
+
+        # Determine current disabled state
+        current_disabled = target.get('disabled', False)
+        if isinstance(current_disabled, str):
+            current_disabled = current_disabled.lower() == 'true'
+
+        new_disabled = not current_disabled
+
+        # Apply the change
+        api.path('interface').update(**{
+            '.id':      target['.id'],
+            'disabled': 'yes' if new_disabled else 'no',
+        })
+        api.close()
+
+        return jsonify({'interface': iface_name, 'disabled': new_disabled})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # =============================================================================

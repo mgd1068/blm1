@@ -26,8 +26,14 @@ _mon = CONFIG['credentials']['mikrotik_monitor']
 MONITOR_USER  = _mon['user']
 MONITOR_PASS  = _mon['password']
 MONITOR_GROUP = "monitoring"
-API_PORT      = 8728
-SSH_TIMEOUT   = 5
+
+_wr = CONFIG['credentials'].get('mikrotik_write', {})
+WRITE_USER  = _wr.get('user', '')
+WRITE_PASS  = _wr.get('password', '')
+WRITE_GROUP = "netops"
+
+API_PORT    = 8728
+SSH_TIMEOUT = 5
 
 # Build admin credential lookup: group name → {user, password}
 ADMIN_CREDS = CONFIG['credentials'].get('mikrotik_admin', {})
@@ -162,7 +168,35 @@ def setup(dev):
         else:
             print(f"{pad} {INFO} API service already active on port {API_PORT}")
 
-        # -- 4. Verification -------------------------------------------------
+        # -- 4. Write (netops) group and user --------------------------------
+        if WRITE_USER:
+            out, _ = ssh_run(client, f":put [:len [/user group find name={WRITE_GROUP}]]")
+            if out == "0":
+                ssh_run(client,
+                    f'/user group add name={WRITE_GROUP} '
+                    f'policy=api,write,read '
+                    f'comment="netops write access"'
+                )
+                print(f"{pad} {OK} Group '{WRITE_GROUP}' created  (api,write,read)")
+            else:
+                ssh_run(client, f'/user group set [find name={WRITE_GROUP}] policy=api,write,read')
+                print(f"{pad} {INFO} Group '{WRITE_GROUP}' exists – policies verified")
+
+            out, _ = ssh_run(client, f":put [:len [/user find name={WRITE_USER}]]")
+            if out == "0":
+                _, err = ssh_run(client,
+                    f'/user add name={WRITE_USER} password={WRITE_PASS} '
+                    f'group={WRITE_GROUP} comment="netops write account"'
+                )
+                print(f"{pad} {OK if not err else FAIL} User '{WRITE_USER}' {'created' if not err else 'error: ' + err}")
+            else:
+                ssh_run(client,
+                    f'/user set [find name={WRITE_USER}] '
+                    f'password={WRITE_PASS} group={WRITE_GROUP}'
+                )
+                print(f"{pad} {INFO} User '{WRITE_USER}' exists – password & group verified")
+
+        # -- 5. Verification -------------------------------------------------
         user_ok, _      = ssh_run(client, f":put [:len [/user find name={MONITOR_USER}]]")
         api_dis, _      = ssh_run(client, ":put [/ip service get api disabled]")
         api_port_now, _ = ssh_run(client, ":put [/ip service get api port]")

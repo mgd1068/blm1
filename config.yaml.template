@@ -25,6 +25,11 @@ credentials:
     user: monitor
     password: CHANGE_ME
 
+  # MikroTik write account (used by the Flask app for interface toggles)
+  mikrotik_write:
+    user: netops
+    password: CHANGE_ME
+
   # MikroTik admin accounts (used by setup_switches.py / check_switches.sh only)
   mikrotik_admin:
     benslab:
