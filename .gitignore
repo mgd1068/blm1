@@ -1,0 +1,23 @@
+# Benslab Monitor – Git ignore rules
+
+# Active configuration with real credentials – never commit this
+config.yaml
+
+# Python virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code local settings (machine-specific)
+.claude/
+
+# Editor / OS artifacts
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

@@ -1,0 +1,94 @@
+# =============================================================================
+# Benslab Monitor – Configuration Template
+# =============================================================================
+# Copy this file to config.yaml and fill in your values:
+#
+#   cp config.yaml.template config.yaml
+#   chmod 600 config.yaml
+#
+# config.yaml is excluded from version control (.gitignore).
+# Never commit real credentials to a repository.
+# =============================================================================
+
+settings:
+  # How often (seconds) to ping all devices
+  ping_interval: 5
+  # Ping timeout in seconds
+  timeout: 1
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+credentials:
+  # MikroTik read-only monitor account (used by the Flask app at runtime)
+  mikrotik_monitor:
+    user: monitor
+    password: CHANGE_ME
+
+  # MikroTik admin accounts (used by setup_switches.py / check_switches.sh only)
+  mikrotik_admin:
+    benslab:
+      user: admin
+      password: CHANGE_ME
+    natco:
+      user: admin
+      password: CHANGE_ME
+
+# ---------------------------------------------------------------------------
+# Devices
+# type: "mikrotik" | "opnsense" | "none"
+# ---------------------------------------------------------------------------
+devices:
+
+  # Top layer – Firewalls
+  top_layer:
+    - id: opn1
+      name: OPNSense1
+      ip: 192.168.1.1
+      type: opnsense
+      api_key: "CHANGE_ME"
+      api_secret: "CHANGE_ME"
+
+    - id: opn2
+      name: OPNSense2
+      ip: 192.168.1.2
+      type: opnsense
+      api_key: "CHANGE_ME"
+      api_secret: "CHANGE_ME"
+
+    # Example: device with no API (ping only)
+    - id: pfs
+      name: pfSense
+      ip: 192.168.1.3
+      type: none
+
+  # Middle layer – Core switches
+  middle_layer:
+    - id: sw1
+      name: CoreSwitch1
+      ip: 192.168.1.10
+      type: mikrotik
+      admin_cred: benslab   # references credentials.mikrotik_admin.benslab
+
+  # Bottom layer – Site switches (NatcoSwitches)
+  # Devices with 10.20.x.x are automatically pinged via both
+  # 10.20.x.x (primary) and 10.10.x.x (alternate path).
+  bottom_layer:
+    - id: site1
+      name: MTS-SITE1
+      ip: 10.20.1.2
+      type: mikrotik
+      admin_cred: natco
+
+  # Processing layer – special-purpose devices
+  processing_layer:
+    - id: proc1
+      name: Processing1
+      ip: 192.168.1.20
+      type: mikrotik
+      admin_cred: natco
+
+    - id: ts
+      name: Terminalserver
+      ip: 192.168.1.99
+      type: none

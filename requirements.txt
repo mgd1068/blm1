@@ -1,0 +1,36 @@
+# Benslab Monitor – Python dependencies
+# Generated from: venv/bin/pip freeze (Python 3.13, March 2026)
+# Install with: pip install -r requirements.txt
+
+# Core framework
+Flask==3.1.2
+Werkzeug==3.1.5
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+blinker==1.9.0
+itsdangerous==2.2.0
+click==8.3.1
+
+# HTTP / networking
+requests==2.32.5
+urllib3==2.6.3
+certifi==2026.1.4
+charset-normalizer==3.4.4
+idna==3.11
+
+# MikroTik RouterOS API
+librouteros==4.0.0
+
+# SSH (used by setup_switches.py / check_switches.sh)
+paramiko==4.0.0
+bcrypt==5.0.0
+cryptography==46.0.5
+cffi==2.0.0
+pycparser==3.0
+PyNaCl==1.6.2
+
+# Configuration parsing
+PyYAML==6.0.3
+
+# Task runner (optional, not used by app.py)
+invoke==2.2.1

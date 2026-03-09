@@ -1,0 +1,2000 @@
+================================================================================
+  BENSLAB MONITOR – Vollständige Dokumentation
+  Stand: Februar 2026
+================================================================================
+
+Dieses Dokument erklärt den gesamten Code des Benslab Monitors Zeile für Zeile,
+so dass auch Einsteiger in Python und Webentwicklung verstehen, was das Programm
+tut, wie es aufgebaut ist und warum bestimmte Entscheidungen getroffen wurden.
+
+--------------------------------------------------------------------------------
+  ÜBERBLICK: Was macht das Programm?
+--------------------------------------------------------------------------------
+
+Der Benslab Monitor ist ein Netzwerk-Überwachungswerkzeug. Es:
+
+  1. Pingt alle konfigurierten Netzwerkgeräte regelmäßig an (alle 5 Sekunden)
+     und zeigt an, ob sie erreichbar sind (grüner/roter Rand der Kachel).
+
+  2. Fragt bei MikroTik-Routern tiefergehende Details ab: CPU-Last, RAM-
+     Auslastung, WireGuard-Tunnel, EoIP-Tunnel, physikalische Interfaces
+     und Benutzer (alle 30 Sekunden über die RouterOS-API).
+
+  3. Fragt bei OPNsense-Firewalls Details ab: CPU, RAM, Uptime, Firewall-
+     States, Interfaces, WireGuard-Peers (alle 30 Sekunden über die REST-API).
+
+  4. Misst für NatcoSwitches (10.20.x.x) die Ping-Latenz auf beiden
+     möglichen Wegen: primär (10.20.x.x) und alternativ (10.10.x.x).
+
+  5. Stellt alle Daten über eine Weboberfläche dar, die im Browser aufgerufen
+     werden kann (http://serverip:5000).
+
+Die Architektur besteht aus zwei Teilen:
+  - Backend:  app.py          (Python / Flask – läuft auf dem Server)
+  - Frontend: templates/index.html  (HTML + CSS + JavaScript – läuft im Browser)
+
+Dazu gibt es eine Konfigurationsdatei:
+  - config.json               (welche Geräte gibt es, wie heißen sie, welche IP)
+
+--------------------------------------------------------------------------------
+  DATEI: config.json
+--------------------------------------------------------------------------------
+
+Die Konfigurationsdatei beschreibt alle überwachten Geräte. Sie ist in JSON
+geschrieben – ein einfaches Textformat mit geschweiften Klammern und Listen.
+
+Aufbau:
+
+  {
+    "settings": {
+      "ping_interval": 5,     ← Wie oft (in Sekunden) gepingt wird
+      "timeout": 1            ← Timeout für Ping in Sekunden (wird im Code
+    },                          direkt über den Ping-Befehl gesteuert)
+    "devices": {
+      "top_layer":    [...],  ← Firewalls (obere Zeile im Bild)
+      "middle_layer": [...],  ← Core-Switches (mittlere Zeile)
+      "bottom_layer": [...],  ← NatcoSwitches / Site-Switches (untere Zeile)
+      "processing_layer": [...]  ← Processing-Geräte (unterste Zeile)
+    }
+  }
+
+Jedes Gerät hat folgende Felder:
+  "id":         Eindeutiger Name, wird intern als Schlüssel verwendet (z.B. "cz")
+  "name":       Anzeigename im Browser (z.B. "MTS-CZ")
+  "ip":         IP-Adresse, an die gepingt wird und die abgefragt wird
+  "type":       Art des Geräts: "mikrotik", "opnsense" oder "none"
+                Bei "none" wird keine Detailabfrage gemacht und kein Modal
+                geöffnet (z.B. pfSense, Terminalserver)
+  "api_key":    Nur bei OPNsense: API-Schlüssel für die REST-API
+  "api_secret": Nur bei OPNsense: API-Passwort für die REST-API
+
+
+================================================================================
+  DATEI: app.py  (Python-Backend)
+================================================================================
+
+Das Backend ist mit dem Framework "Flask" geschrieben. Flask ist ein kleiner
+Webserver, der HTTP-Anfragen entgegennimmt und Antworten zurückschickt.
+
+Das Programm startet zwei Hintergrund-Threads:
+  1. monitor_loop   – pingt alle Geräte alle 5 Sekunden
+  2. details_loop   – fragt Details von MikroTik/OPNsense alle 30 Sekunden ab
+
+Der Flask-Webserver läuft im Hauptthread und beantwortet Browser-Anfragen.
+
+==============================================================================
+
+# ── IMPORTS ──────────────────────────────────────────────────────────────────
+
+import json          # JSON lesen/schreiben (für config.json und API-Antworten)
+import re            # Reguläre Ausdrücke (zum Suchen in Texten, z.B. Ping-Output)
+import subprocess    # Externe Programme starten (z.B. den "ping"-Befehl)
+import platform      # Betriebssystem erkennen (Windows vs. Linux/Mac)
+import threading     # Mehrere Aufgaben gleichzeitig ausführen (Threads)
+import time          # Warten / schlafen (time.sleep)
+import urllib3       # HTTP-Bibliothek (wird für SSL-Warnungen verwendet)
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+# ThreadPoolExecutor: Verwaltet einen Pool von Threads.
+#   Statt manuell Threads zu erstellen, übergibt man Aufgaben (Funktionen) an
+#   den Pool. Er führt sie parallel aus – ideal für viele gleichzeitige Pings.
+# as_completed: Liefert Futures in der Reihenfolge, in der sie fertig werden.
+#   Ein "Future" ist ein Platzhalter für ein Ergebnis, das noch berechnet wird.
+
+import requests      # HTTP-Anfragen stellen (für OPNsense REST-API)
+import librouteros   # MikroTik RouterOS API-Bibliothek
+from librouteros.exceptions import TrapError, FatalError
+# TrapError:  RouterOS gibt einen Fehler zurück (z.B. "kein Zugriff auf /user")
+# FatalError: Verbindung zur RouterOS-API ist abgebrochen
+
+from flask import Flask, render_template, jsonify
+# Flask:           Das Web-Framework selbst
+# render_template: Lädt eine HTML-Datei aus dem "templates/"-Ordner und füllt
+#                  Python-Variablen ein (Jinja2-Templating)
+# jsonify:         Wandelt ein Python-Dictionary in eine JSON-HTTP-Antwort um
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# OPNsense verwendet ein selbst-signiertes SSL-Zertifikat. Ohne diese Zeile
+# würde Python bei jedem HTTPS-Aufruf eine Warnung ausgeben. Wir unterdrücken
+# das, weil wir wissen, dass das Zertifikat "unsicher" aber gewollt ist.
+
+==============================================================================
+
+# ── GLOBALE VARIABLEN ─────────────────────────────────────────────────────────
+
+app = Flask(__name__)
+# Erstellt die Flask-Anwendung. __name__ ist der Name des aktuellen Moduls
+# (hier: "app"). Flask verwendet das, um Dateipfade zu finden.
+
+device_status  = {}
+# Speichert den Ping-Status aller Geräte.
+# Beispiel: {"cz": "up", "me": "down", "ben1": "up", ...}
+# Wird von monitor_loop befüllt und vom Browser alle 2 Sekunden abgefragt.
+
+device_details = {}
+# Speichert die Detail-Daten (CPU, RAM, Interfaces usw.) aller Geräte.
+# Beispiel: {"cz": {"cpu": 12, "ram_used_pct": 45, "users": [...], ...}}
+# Wird von details_loop befüllt und vom Browser alle 30 Sekunden abgefragt.
+
+device_ping    = {}
+# Speichert Ping-Latenz und Erreichbarkeit für alle Geräte, für NatcoSwitches
+# mit beiden IPs (primär 10.20.x.x und alternativ 10.10.x.x).
+# Beispiel: {"cz": {"primary": {"ip": "10.20.4.2", "reachable": True, "latency": 22.5},
+#                   "alt":     {"ip": "10.10.4.2", "reachable": True, "latency": 21.8}}}
+
+config         = {}
+# Der Inhalt von config.json, nach load_config() befüllt.
+
+MIKROTIK_USER    = "monitor"
+MIKROTIK_PASS    = "monitor"
+# Zugangsdaten für alle MikroTik-Router. Der User "monitor" ist ein Read-Only-
+# Benutzer, der auf den Routern eingerichtet wurde.
+
+DETAILS_INTERVAL = 30
+# Wie oft (in Sekunden) die Detail-Abfrage für MikroTik/OPNsense läuft.
+# 30 Sekunden sind ein guter Kompromiss: nicht zu häufig (belastet die Router),
+# nicht zu selten (Daten bleiben aktuell).
+
+API_TIMEOUT      = 8
+# Wie lange (in Sekunden) auf eine Antwort von MikroTik/OPNsense gewartet wird.
+# Antwortet ein Gerät nicht innerhalb von 8 Sekunden, gilt die Abfrage als
+# fehlgeschlagen.
+
+MIKROTIK_PHYS_TYPES = {'ether', 'sfp', 'sfp-sfpplus', 'sfpplus', 'combo'}
+# RouterOS kennt viele Interface-Typen (loopback, bridge, vlan, wg, ...).
+# Wir interessieren uns nur für physikalische Anschlüsse: Ethernet (ether),
+# SFP-Module (sfp, sfp-sfpplus, sfpplus) und Combo-Ports (combo).
+
+==============================================================================
+
+# ── KONFIGURATION LADEN ───────────────────────────────────────────────────────
+
+def load_config():
+    global config
+    # "global config" bedeutet: Wir schreiben nicht in eine lokale Variable,
+    # sondern in die globale Variable "config" ganz oben in der Datei.
+    # Ohne "global" würde Python eine neue, lokale Variable "config" anlegen,
+    # die nach Ende der Funktion wieder verschwinden würde.
+
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+    # Öffnet config.json zum Lesen ('r' = read).
+    # json.load() parst den Text in ein Python-Dictionary.
+    # "with open(...) as f:" schließt die Datei automatisch, auch bei Fehlern.
+
+==============================================================================
+
+# ── PING-FUNKTIONEN ───────────────────────────────────────────────────────────
+
+def ping_host_with_latency(ip):
+    """
+    Pingt eine IP-Adresse einmal an und gibt ein Tupel zurück:
+      (erreichbar: bool, latenz_ms: float oder None)
+
+    Beispiele:
+      ping_host_with_latency("10.20.4.2")  →  (True, 22.5)
+      ping_host_with_latency("10.20.8.2")  →  (False, None)  ← nicht erreichbar
+    """
+
+    param = '-n' if platform.system().lower() == 'windows' else '-c'
+    # Unter Windows lautet der Parameter für "1 Paket senden": ping -n 1
+    # Unter Linux/Mac lautet er:                               ping -c 1
+
+    cmd = ['ping', param, '1', ip]
+    # Baut den Befehl als Liste zusammen. subprocess.run() erwartet eine Liste.
+    # Entspricht auf Linux dem Shell-Befehl: ping -c 1 10.20.4.2
+
+    if platform.system().lower() != 'windows':
+        cmd.extend(['-W', '1'])
+    # Unter Linux: -W 1 bedeutet "warte maximal 1 Sekunde auf Antwort".
+    # Das verhindert, dass ein Ping bei einem ausgefallenen Gerät viel zu lange
+    # wartet und den Monitor verlangsamt.
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        # subprocess.run() führt den Ping-Befehl aus.
+        # capture_output=True: Ausgabe (stdout/stderr) wird in proc.stdout/stderr
+        #                       gespeichert, statt im Terminal ausgegeben.
+        # text=True:           Ausgabe als Text (String), nicht als Bytes.
+        # timeout=3:           Wenn der Prozess nach 3 Sekunden noch läuft,
+        #                       wird er zwangsweise beendet.
+
+        if proc.returncode == 0:
+            # returncode == 0 bedeutet: Ping war erfolgreich (Gerät antwortet).
+            # returncode != 0 bedeutet: Ping fehlgeschlagen (Gerät antwortet nicht).
+
+            m = re.search(r'time[=<]\s*(\d+(?:\.\d+)?)', proc.stdout, re.IGNORECASE)
+            # Regulärer Ausdruck, um die Latenz aus der Ping-Ausgabe zu extrahieren.
+            # Linux-Ausgabe sieht so aus:
+            #   64 bytes from 10.20.4.2: icmp_seq=1 ttl=63 time=22.5 ms
+            # Das Muster "time[=<]\s*(\d+(?:\.\d+)?)" bedeutet:
+            #   time     = das Wort "time"
+            #   [=<]     = gefolgt von "=" oder "<"
+            #   \s*      = optional Leerzeichen
+            #   (\d+(?:\.\d+)?) = eine Zahl (mit optionaler Dezimalstelle), z.B. 22.5
+            # Die runden Klammern () fangen den Zahlenwert ein.
+
+            if m:
+                return True, round(float(m.group(1)), 1)
+                # m.group(1) = der erste eingefangene Wert = die Latenzzahl als String
+                # float(...) = in Kommazahl umwandeln (z.B. "22.5" → 22.5)
+                # round(..., 1) = auf 1 Nachkommastelle runden
+
+            return True, None
+            # Ping erfolgreich, aber Latenz konnte nicht geparst werden.
+            # Das kommt selten vor (z.B. bei sehr ungewöhnlichen Ping-Ausgaben).
+
+        return False, None
+        # Ping fehlgeschlagen: Gerät nicht erreichbar.
+
+    except Exception:
+        return False, None
+        # Fehler beim Ausführen des Befehls (z.B. Timeout abgelaufen,
+        # oder "ping" nicht gefunden). Sicherheitshalber ebenfalls False.
+
+
+def get_alt_ip(ip):
+    """
+    Für NatcoSwitches gibt es zwei Routen:
+      - Primär:      10.20.x.x  (z.B. 10.20.4.2  für MTS-CZ)
+      - Alternativ:  10.10.x.x  (z.B. 10.10.4.2  für MTS-CZ)
+
+    Diese Funktion berechnet aus der primären IP die alternative.
+    Beispiel: get_alt_ip("10.20.4.2") → "10.10.4.2"
+              get_alt_ip("192.168.200.130") → None  (kein NatcoSwitch)
+    """
+
+    parts = ip.split('.')
+    # Zerlegt die IP-Adresse an den Punkten in eine Liste.
+    # "10.20.4.2".split('.') ergibt ["10", "20", "4", "2"]
+
+    if len(parts) == 4 and parts[0] == '10' and parts[1] == '20':
+        # Prüfe: Hat die IP genau 4 Teile, beginnt mit "10" und hat "20" als zweiten Teil?
+        return f"10.10.{parts[2]}.{parts[3]}"
+        # f-String: Baut die neue IP zusammen, indem der zweite Teil auf "10" geändert wird.
+        # "10.10." + parts[2] ("4") + "." + parts[3] ("2") = "10.10.4.2"
+
+    return None
+    # Keine 10.20.x.x-Adresse → kein alternativer Pfad.
+
+==============================================================================
+
+# ── ROUTEROS HILFSFUNKTION ────────────────────────────────────────────────────
+
+def parse_ros_duration(s):
+    """
+    MikroTik gibt Zeitspannen in einem eigenen Format aus, z.B.:
+      "2d3h15m40s"  = 2 Tage, 3 Stunden, 15 Minuten, 40 Sekunden
+      "3m20s"       = 3 Minuten, 20 Sekunden
+      "1w2d"        = 1 Woche, 2 Tage
+
+    Diese Funktion wandelt solche Strings in Sekunden um.
+    Beispiel: parse_ros_duration("3m20s") → 200
+
+    Verwendung: Wir prüfen damit den letzten WireGuard-Handshake. Ist er
+    weniger als 180 Sekunden (3 Minuten) her, gilt der Peer als "up".
+    """
+
+    if not s:
+        return None
+        # Leerer String → kein Wert
+
+    total = 0
+    for val, unit in re.findall(r'(\d+)([wdhms])', s):
+        # re.findall sucht alle Vorkommen des Musters im String.
+        # Muster: (\d+) = eine oder mehrere Ziffern (Zahl),
+        #         ([wdhms]) = ein Buchstabe aus {w,d,h,m,s}
+        # Ergebnis für "2d3h15m40s": [("2","d"), ("3","h"), ("15","m"), ("40","s")]
+
+        val = int(val)
+        # Wandelt die Zahl von String in Integer um.
+
+        if unit == 'w':   total += val * 604800   # 1 Woche  = 7 * 24 * 60 * 60 s
+        elif unit == 'd': total += val * 86400    # 1 Tag    = 24 * 60 * 60 s
+        elif unit == 'h': total += val * 3600     # 1 Stunde = 60 * 60 s
+        elif unit == 'm': total += val * 60       # 1 Minute = 60 s
+        elif unit == 's': total += val            # Sekunden direkt addieren
+
+    return total if total > 0 else None
+    # Gibt die Gesamtzahl der Sekunden zurück, oder None wenn 0 (kein Ergebnis).
+
+==============================================================================
+
+# ── MIKROTIK-ABFRAGE ──────────────────────────────────────────────────────────
+
+def query_mikrotik(dev):
+    """
+    Fragt über die RouterOS-API alle relevanten Daten eines MikroTik-Geräts ab.
+    Parameter "dev" ist ein Dictionary aus config.json, z.B.:
+      {"id": "cz", "name": "MTS-CZ", "ip": "10.20.4.2", "type": "mikrotik"}
+
+    Gibt ein Dictionary mit allen abgefragten Werten zurück.
+    """
+
+    # Ergebnis-Dictionary mit Standardwerten (None = noch nicht abgefragt).
+    result = {
+        'cpu':          None,   # CPU-Auslastung in %
+        'ram_used_pct': None,   # RAM-Auslastung in %
+        'ram_free_mb':  None,   # Freier RAM in MB
+        'ram_total_mb': None,   # Gesamter RAM in MB
+        'uptime':       None,   # Laufzeit als String (z.B. "3d5h20m")
+        'wireguard':    [],     # Liste der WireGuard-Peers
+        'eoip':         [],     # Liste der EoIP-Tunnel
+        'interfaces':   [],     # Liste der physikalischen Interfaces
+        'users':        [],     # Liste der Benutzer
+        'error':        None,   # Fehlermeldung, falls etwas schiefgeht
+    }
+
+    try:
+        api = librouteros.connect(
+            dev['ip'],              # IP-Adresse des Routers
+            username=MIKROTIK_USER, # "monitor"
+            password=MIKROTIK_PASS, # "monitor"
+            port=8728,              # RouterOS API-Port (Standard: 8728 = unverschlüsselt)
+            timeout=API_TIMEOUT,    # 8 Sekunden Timeout
+        )
+        # Baut eine TCP-Verbindung zur RouterOS-API auf.
+        # Die RouterOS-API ist ein binäres Protokoll (kein HTTP!), das MikroTik
+        # auf Port 8728 bereitstellt. librouteros übernimmt das Protokoll.
+
+        # ── SYSTEM-RESSOURCEN ─────────────────────────────────────────────────
+        for r in api.path('system', 'resource'):
+            # api.path('system', 'resource') entspricht dem RouterOS-Befehl:
+            #   /system resource print
+            # Es gibt genau einen Eintrag (den aktuellen Systemzustand).
+
+            result['cpu'] = int(r.get('cpu-load', 0))
+            # cpu-load: aktueller CPU-Wert in Prozent (0–100)
+            # int() wandelt den Wert sicherheitshalber in eine ganze Zahl um.
+
+            total = int(r.get('total-memory', 1))
+            free  = int(r.get('free-memory', 0))
+            # total-memory und free-memory sind in Bytes angegeben.
+            # Beispiel: total = 134217728 (= 128 MB), free = 73400320 (= ~70 MB)
+            # Der Standardwert 1 für total verhindert eine Division durch Null.
+
+            result['ram_total_mb'] = round(total / 1024 / 1024)
+            result['ram_free_mb']  = round(free  / 1024 / 1024)
+            # Bytes → MB: durch 1024 (→ KB) und nochmal durch 1024 (→ MB)
+            # round() rundet auf die nächste ganze Zahl.
+
+            result['ram_used_pct'] = round((total - free) / total * 100)
+            # Belegter RAM = gesamt - frei. Prozent = belegter_RAM / gesamt * 100
+
+            result['uptime'] = r.get('uptime', 'N/A')
+            # Uptime als RouterOS-Zeitstring, z.B. "3d5h20m10s"
+
+        # ── WIREGUARD-PEERS ───────────────────────────────────────────────────
+        try:
+            for peer in api.path('interface', 'wireguard', 'peers'):
+                # Entspricht: /interface wireguard peers print
+                # Liefert alle konfigurierten WireGuard-Peers.
+
+                last_hs = peer.get('last-handshake', '')
+                # last-handshake: Zeitpunkt des letzten erfolgreichen Handshakes
+                # als RouterOS-Zeitstring, z.B. "2m30s"
+                # Bei noch nie verbundenen Peers: leerer String
+
+                secs = parse_ros_duration(last_hs)
+                # Wandelt den Zeitstring in Sekunden um.
+
+                name = (peer.get('comment') or '').strip() or peer.get('interface', 'WG Peer')
+                # Wir bevorzugen den Kommentar als Anzeigename (meist beschreibend,
+                # z.B. "Benslab1"). Falls kein Kommentar, nehmen wir den Interface-Namen.
+                # (peer.get('comment') or '') stellt sicher, dass wir nie None haben.
+                # .strip() entfernt führende/nachfolgende Leerzeichen.
+
+                result['wireguard'].append({
+                    'name':     name,
+                    'endpoint': peer.get('current-endpoint-address', '—'),
+                    # current-endpoint-address: öffentliche IP des Gegenstücks
+                    # '—' ist der Standardwert, wenn kein Endpunkt bekannt ist
+                    'status':   'up' if (secs is not None and secs < 180) else 'down',
+                    # "up" wenn der letzte Handshake weniger als 180 Sekunden (3 Min.) her ist.
+                    # WireGuard sendet alle ~2 Minuten einen Keepalive/Handshake.
+                    # Ist der letzte Handshake > 3 Min. her, gilt die Verbindung als tot.
+                })
+
+        except (TrapError, FatalError):
+            pass
+            # Falls der Router kein WireGuard hat (TrapError: Pfad existiert nicht),
+            # oder die Verbindung abbricht (FatalError), ignorieren wir den Fehler.
+            # Das Programm läuft weiter – wireguard bleibt eine leere Liste.
+
+        # ── EOIP-TUNNEL ───────────────────────────────────────────────────────
+        try:
+            for tun in api.path('interface', 'eoip'):
+                # Entspricht: /interface eoip print
+                # EoIP (Ethernet over IP) ist ein MikroTik-proprietäres Tunnel-Protokoll.
+
+                running = tun.get('running', False)
+                if isinstance(running, str):
+                    running = running.lower() == 'true'
+                # RouterOS gibt "running" manchmal als String ("true"/"false"),
+                # manchmal als Boolean. isinstance(running, str) prüft den Typ.
+                # Wir normalisieren auf einen echten Boolean.
+
+                result['eoip'].append({
+                    'name':   tun.get('name', 'eoip'),
+                    'remote': tun.get('remote-address', '—'),
+                    # remote-address: IP des anderen Tunnelendpunkts
+                    'status': 'up' if running else 'down',
+                })
+
+        except (TrapError, FatalError):
+            pass
+
+        # ── PHYSIKALISCHE INTERFACES ──────────────────────────────────────────
+        try:
+            for iface in api.path('interface'):
+                # Entspricht: /interface print
+                # Liefert ALLE Interfaces: ether, bridge, vlan, wg, eoip, lo, ...
+                # Wir filtern sofort nach physikalischen Typen.
+
+                itype = iface.get('type', '')
+                if itype not in MIKROTIK_PHYS_TYPES:
+                    continue
+                # "continue" springt zur nächsten Iteration der for-Schleife.
+                # Damit überspringen wir alle nicht-physikalischen Interfaces.
+
+                if iface.get('disabled', False):
+                    continue
+                # Deaktivierte Ports interessieren uns nicht.
+
+                running = iface.get('running', False)
+                if isinstance(running, str):
+                    running = running.lower() == 'true'
+                # Gleiche Normalisierung wie bei EoIP.
+
+                result['interfaces'].append({
+                    'name':    iface.get('name', '?'),    # z.B. "ether1"
+                    'comment': (iface.get('comment') or '').strip(),  # z.B. "WAN"
+                    'status':  'up' if running else 'down',
+                    'speed':   '—',   # Wird im nächsten Schritt befüllt
+                })
+
+        except (TrapError, FatalError):
+            pass
+
+        # ── INTERFACE-GESCHWINDIGKEIT (Verhandelte Speed) ─────────────────────
+        try:
+            speed_map = {}
+            for eth in api.path('interface', 'ethernet'):
+                # Entspricht: /interface ethernet print
+                # Liefert Details zu Ethernet-Ports, u.a. die verhandelte Geschwindigkeit.
+
+                speed_map[eth.get('name', '')] = eth.get('rate', eth.get('speed', '—'))
+                # 'rate' ist der aktuelle ausgehandelte Wert (z.B. "1Gbps").
+                # Fallback auf 'speed' für ältere RouterOS-Versionen.
+                # Wir bauen ein Dictionary: Interface-Name → Geschwindigkeit.
+
+            for iface in result['interfaces']:
+                if iface['name'] in speed_map:
+                    iface['speed'] = speed_map[iface['name']] or '—'
+            # Wir ergänzen für jedes bereits gesammelte Interface die Geschwindigkeit,
+            # indem wir im speed_map nachschlagen.
+
+        except (TrapError, FatalError):
+            pass
+
+        # ── BENUTZER & SSH-KEYS ───────────────────────────────────────────────
+        try:
+            ssh_users = set()
+            # Ein "set" ist wie eine Liste, aber ohne Duplikate und sehr schnell
+            # beim Suchen. Wir speichern darin die Namen aller User, die einen
+            # SSH-Key hinterlegt haben.
+
+            try:
+                for key in api.path('user', 'ssh-keys'):
+                    # Entspricht: /user ssh-keys print
+                    # Liefert alle hinterlegten SSH-Public-Keys.
+                    # Jeder Eintrag hat ein Feld "user" mit dem Benutzernamen.
+
+                    u = key.get('user', '')
+                    if u:
+                        ssh_users.add(u)
+                        # Fügt den Benutzernamen in das Set ein.
+                        # add() auf einem Set fügt einen Wert hinzu (kein Duplikat).
+
+            except (TrapError, FatalError):
+                pass
+                # Auf manchen RouterOS-Versionen ist /user/ssh-keys nicht
+                # verfügbar. Das ist kein kritischer Fehler.
+
+            for user in api.path('user'):
+                # Entspricht: /user print
+                # Liefert alle lokalen Benutzerkonten des Routers.
+
+                name = user.get('name', '')
+                result['users'].append({
+                    'name':        name,
+                    'group':       user.get('group', ''),
+                    # 'group': die Benutzergruppe, z.B. "full", "read", "monitoring"
+                    'has_ssh_key': name in ssh_users,
+                    # Prüft: Ist der Benutzername im Set der SSH-Key-Benutzer?
+                    # "in" auf einem set ist O(1) – also extrem schnell.
+                })
+
+        except (TrapError, FatalError):
+            pass
+
+        api.close()
+        # Schließt die TCP-Verbindung zum Router ordentlich.
+
+    except Exception as e:
+        result['error'] = str(e)
+        # Fängt ALLE Fehler auf, die nicht schon oben behandelt wurden.
+        # Typische Fehler: Verbindung abgelehnt, falsches Passwort, Timeout.
+        # str(e) wandelt die Exception in einen lesbaren Fehlertext um.
+
+    return result
+    # Gibt das Dictionary zurück – entweder mit Daten oder mit error gesetzt.
+
+==============================================================================
+
+# ── OPNSENSE-HILFSFUNKTIONEN ──────────────────────────────────────────────────
+
+# OPNsense hat eine HTTP REST-API (Webservice). Anfragen werden per HTTPS
+# gestellt, die Antworten sind JSON. Für die Authentifizierung nutzt OPNsense
+# HTTP Basic Auth mit API-Key und API-Secret aus config.json.
+
+def _opn_get(session, base, path, auth):
+    r = session.get(f"{base}/{path}", auth=auth, timeout=API_TIMEOUT)
+    # Sendet eine HTTP-GET-Anfrage.
+    # f"{base}/{path}" = URL zusammensetzen, z.B.:
+    #   "https://192.168.200.1/api/diagnostics/system/system_time"
+    # auth=auth = sendet Benutzername+Passwort im HTTP-Header (Basic Auth)
+
+    r.raise_for_status()
+    # Wenn der HTTP-Statuscode ein Fehler ist (4xx/5xx), wird eine Exception
+    # ausgelöst. Damit brechen wir sofort ab statt fehlerhafte Daten zu verarbeiten.
+
+    return r.json()
+    # Parst die JSON-Antwort in ein Python-Dictionary.
+
+def _opn_post(session, base, path, auth, data=None):
+    r = session.post(f"{base}/{path}", auth=auth, timeout=API_TIMEOUT, json=data or {})
+    r.raise_for_status()
+    return r.json()
+    # Wie _opn_get, aber sendet eine POST-Anfrage (für API-Endpunkte, die
+    # Daten im Request-Body erwarten). Aktuell nicht aktiv verwendet.
+
+def _opn_sse_first(session, base, path, auth):
+    """
+    Liest das erste Datenevent von einem Server-Sent Events (SSE) Stream.
+
+    OPNsense's CPU-Endpunkt gibt keinen einfachen JSON-Wert zurück, sondern
+    einen Datenstrom (Stream) im SSE-Format. Der Browser würde diesen Stream
+    fortlaufend lesen. Wir lesen nur das erste Event und schließen dann.
+
+    SSE-Format:
+      data: {"total": 5.2, "user": 3.1, "sys": 2.1, "idle": 94.8}
+      (leere Zeile)
+      data: {"total": 4.8, ...}
+      ...
+    """
+
+    with session.get(f"{base}/{path}", auth=auth, stream=True,
+                     timeout=API_TIMEOUT) as r:
+        # stream=True: Die Antwort wird nicht sofort vollständig heruntergeladen,
+        # sondern Zeile für Zeile gelesen.
+
+        r.raise_for_status()
+        for raw in r.iter_lines():
+            # iter_lines() liefert eine Zeile nach der anderen als Bytes.
+
+            if raw and raw.startswith(b'data: '):
+                # Wir suchen eine Zeile, die mit "data: " beginnt.
+                # b'data: ' = Byte-String (weil iter_lines() Bytes liefert)
+
+                return json.loads(raw[6:])
+                # raw[6:] = Alles ab Position 6 (nach "data: ")
+                # json.loads() parst den JSON-Text in ein Dictionary.
+    return {}
+    # Falls kein Datenevent gefunden wurde, leeres Dictionary zurückgeben.
+
+==============================================================================
+
+# ── OPNSENSE-ABFRAGE ──────────────────────────────────────────────────────────
+
+def query_opnsense(dev):
+    """
+    Fragt alle relevanten Daten einer OPNsense-Firewall ab.
+    Analog zu query_mikrotik(), aber über HTTP statt RouterOS-API.
+    """
+
+    result = {
+        'cpu':          None,
+        'ram_used_pct': None,
+        'ram_free_mb':  None,
+        'ram_total_mb': None,
+        'uptime':       None,
+        'loadavg':      None,   # Load Average (Linux-Systemlast, z.B. "0.23 0.18 0.12")
+        'fw_states':    None,   # Aktuelle Anzahl Firewall-Verbindungen (States)
+        'fw_limit':     None,   # Maximale Anzahl States
+        'wireguard':    [],
+        'interfaces':   [],
+        'error':        None,
+    }
+
+    base    = f"https://{dev['ip']}/api"
+    # Basis-URL für alle API-Aufrufe, z.B. "https://192.168.200.1/api"
+
+    auth    = (dev['api_key'], dev['api_secret'])
+    # HTTP Basic Auth als Tupel (Benutzername, Passwort)
+
+    session = requests.Session()
+    session.verify = False
+    # session.verify = False: SSL-Zertifikat nicht prüfen.
+    # OPNsense hat ein selbst-signiertes Zertifikat – würde sonst einen Fehler geben.
+
+    errors = []
+    # Liste für nicht-kritische Fehler. Falls einzelne API-Endpunkte fehlschlagen,
+    # aber andere funktionieren, wollen wir trotzdem alle verfügbaren Daten zeigen.
+    # Am Ende werden alle Fehler zu einer Meldung zusammengefasst.
+
+    # ── CPU ───────────────────────────────────────────────────────────────────
+    try:
+        data = _opn_sse_first(session, base, 'diagnostics/cpu_usage/stream', auth)
+        # Ruft den SSE-Stream ab und liest das erste Event.
+
+        total_cpu = data.get('total', None)
+        if total_cpu is None:
+            idle = float(data.get('idle', 100))
+            total_cpu = round(100 - idle)
+        # Einige OPNsense-Versionen liefern direkt "total" (CPU-Gesamt-Auslastung),
+        # andere liefern nur "idle" (CPU-Leerlauf). In letzterem Fall berechnen wir:
+        # Auslastung = 100 - Leerlauf
+
+        result['cpu'] = round(float(total_cpu))
+    except Exception as e:
+        errors.append(f"CPU: {e}")
+
+    # ── RAM ───────────────────────────────────────────────────────────────────
+    try:
+        data = _opn_get(session, base, 'diagnostics/system/system_resources', auth)
+        mem  = data.get('memory', data)
+        # Manche OPNsense-Versionen verschachteln die Daten unter 'memory',
+        # andere geben sie direkt im Root zurück. Fallback: Root-Dict nehmen.
+
+        total = int(mem.get('total', 0))
+        used  = int(mem.get('used', 0))
+        if total > 0:
+            result['ram_total_mb'] = round(total / 1024 / 1024)
+            result['ram_free_mb']  = round((total - used) / 1024 / 1024)
+            result['ram_used_pct'] = round(used / total * 100)
+    except Exception as e:
+        errors.append(f"RAM: {e}")
+
+    # ── UPTIME / LOAD ─────────────────────────────────────────────────────────
+    try:
+        data = _opn_get(session, base, 'diagnostics/system/system_time', auth)
+        result['uptime']  = data.get('uptime')
+        result['loadavg'] = data.get('loadavg')
+        # uptime:  z.B. "3 days, 5:20:10"
+        # loadavg: z.B. "0.23 0.18 0.12" (1-Min, 5-Min, 15-Min Durchschnitt)
+    except Exception as e:
+        errors.append(f"Uptime: {e}")
+
+    # ── FIREWALL-STATES ───────────────────────────────────────────────────────
+    try:
+        data = _opn_get(session, base, 'diagnostics/firewall/pf_states', auth)
+        result['fw_states'] = data.get('current')
+        result['fw_limit']  = data.get('limit')
+        # pf = Packet Filter (der Firewall-Engine von BSD/OPNsense)
+        # States = aktive Verbindungseinträge in der State-Tabelle
+        # Beispiel: current=12543, limit=3100000
+    except Exception as e:
+        errors.append(f"FW-States: {e}")
+
+    # ── PHYSIKALISCHE INTERFACES ──────────────────────────────────────────────
+    try:
+        data = _opn_get(session, base, 'diagnostics/interface/get_interface_config', auth)
+        # Liefert ein Dictionary aller Interfaces: {"em0": {...}, "em1": {...}, ...}
+
+        SKIP_PREFIXES = ('lo', 'pfsync', 'enc', 'pflog', 'wg', 'ovpn',
+                         'tun', 'tap', 'gif', 'gre', 'ipsec', '_')
+        # Präfixe, die wir überspringen:
+        # lo      = Loopback (127.0.0.1 – internes Interface)
+        # pfsync  = Firewall-State-Synchronisation zwischen zwei OPNsense-Knoten
+        # enc     = Encrypted-Interface (IPsec)
+        # pflog   = Logging-Interface
+        # wg      = WireGuard (wird separat behandelt)
+        # ovpn    = OpenVPN
+        # tun/tap = Tunnel-Interfaces (VPN)
+        # gif/gre = Weitere Tunnel-Protokolle
+        # ipsec   = IPsec
+        # _       = Interne BSD-Interfaces
+
+        for name, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            # Manchmal enthält die Antwort Nicht-Dictionary-Werte (z.B. Metadaten).
+            # isinstance prüft den Datentyp.
+
+            if any(name.startswith(p) for p in SKIP_PREFIXES):
+                continue
+            # any() gibt True zurück, wenn MINDESTENS EINE Bedingung erfüllt ist.
+            # name.startswith(p) prüft, ob der Interface-Name mit dem Präfix beginnt.
+
+            status_raw = info.get('status', '')
+            is_up = 'active' in status_raw.lower()
+            # BSD/OPNsense-Interfaces haben als Status z.B. "active" (Link up)
+            # oder "no carrier" (kein Kabel). Wir prüfen ob "active" im Status steht.
+
+            media = info.get('media', '—')
+            speed = _parse_bsd_media(media)
+            # 'media' ist ein BSD-String wie "1000baseT <full-duplex>"
+            # _parse_bsd_media wandelt das in "1 Gbps" um.
+
+            descr = info.get('description', info.get('descr', '')).strip()
+            # OPNsense kann Interface-Beschreibungen haben.
+            # Unterschiedliche API-Versionen nutzen 'description' oder 'descr'.
+
+            result['interfaces'].append({
+                'name':    name,
+                'comment': descr,
+                'status':  'up' if is_up else 'down',
+                'speed':   speed,
+            })
+
+    except Exception as e:
+        errors.append(f"Interfaces: {e}")
+
+    # ── WIREGUARD (wg4–wg11) ──────────────────────────────────────────────────
+    try:
+        data = _opn_get(session, base, 'wireguard/service/show', auth)
+        rows = data.get('rows', [])
+        # rows ist eine Liste aller WireGuard-Einträge (Interfaces UND Peers).
+
+        for row in rows:
+            if row.get('type') != 'peer':
+                continue
+            # Wir interessieren uns nur für Peers (Gegenstellen), nicht für
+            # die Interfaces selbst.
+
+            iface = row.get('if', '')
+            m = re.match(r'^wg(\d+)$', iface)
+            if not m or not (4 <= int(m.group(1)) <= 11):
+                continue
+            # Wir filtern auf wg4 bis wg11 (die NatcoSwitch-Tunnel).
+            # re.match prüft ob der Interface-Name dem Muster "wgZAHL" entspricht.
+            # int(m.group(1)) = die Zahl aus dem Namen (z.B. "4" aus "wg4")
+
+            peer_status = row.get('peer-status', 'offline')
+            is_up = peer_status == 'online'
+
+            hs_age = row.get('latest-handshake-age')
+            if hs_age is not None:
+                try:
+                    is_up = int(hs_age) < 180
+                except (ValueError, TypeError):
+                    pass
+            # Verfeinerte Prüfung: Falls "latest-handshake-age" (in Sekunden) verfügbar,
+            # gilt der Peer als up wenn der letzte Handshake < 180s her ist.
+            # Das ist zuverlässiger als der "peer-status"-String.
+
+            result['wireguard'].append({
+                'interface': iface,                           # z.B. "wg4"
+                'name':      row.get('name', '—'),            # Peer-Bezeichnung
+                'endpoint':  row.get('endpoint', '—'),        # öffentliche IP
+                'rx':        _fmt_bytes(row.get('transfer-rx', 0)),  # empfangene Daten
+                'tx':        _fmt_bytes(row.get('transfer-tx', 0)),  # gesendete Daten
+                'status':    'up' if is_up else 'down',
+            })
+
+    except Exception as e:
+        errors.append(f"WireGuard: {e}")
+
+    if errors:
+        result['error'] = ' | '.join(errors)
+        # Alle gesammelten Fehlermeldungen mit " | " verbinden, z.B.:
+        # "CPU: Connection timeout | RAM: 404 Not Found"
+
+    return result
+
+==============================================================================
+
+# ── HILFSFUNKTIONEN ───────────────────────────────────────────────────────────
+
+def _parse_bsd_media(media):
+    """
+    Wandelt einen BSD-Media-String in ein lesbares Format um.
+    Beispiele:
+      "1000baseT <full-duplex>"  →  "1 Gbps"
+      "100baseTX <full-duplex>"  →  "100 Mbps"
+      "10Gbase-T <full-duplex>"  →  "10 Gbps"
+      ""                         →  "—"
+    """
+
+    if not media or media == '—':
+        return '—'
+
+    m = re.search(r'(\d+)(?:base\S+)?', media)
+    # Sucht eine Zahl am Anfang des Media-Strings.
+    # (\d+) = die Zahl (z.B. "1000")
+    # (?:base\S+)? = optional der Rest des Strings (nicht eingefangen)
+
+    if not m:
+        return media   # Unbekanntes Format – Original zurückgeben
+
+    mbps = int(m.group(1))
+    if mbps >= 1000:
+        return f"{mbps // 1000} Gbps"
+        # mbps // 1000 = ganzzahlige Division: 1000 // 1000 = 1, 10000 // 1000 = 10
+    return f"{mbps} Mbps"
+
+
+def _fmt_bytes(b):
+    """
+    Formatiert eine Byte-Zahl in eine lesbare Einheit.
+    Beispiele:
+      1073741824  →  "1.0 GB"
+      1048576     →  "1.0 MB"
+      1024        →  "1.0 KB"
+      500         →  "500 B"
+    """
+
+    try:
+        b = int(b)
+    except (ValueError, TypeError):
+        return '—'
+        # Falls b kein gültiger Zahlenwert ist (z.B. None oder leerer String),
+        # geben wir '—' zurück statt abzustürzen.
+
+    if b >= 1_073_741_824:                    # 1 GB = 1024^3 Bytes
+        return f"{b/1_073_741_824:.1f} GB"
+    if b >= 1_048_576:                        # 1 MB = 1024^2 Bytes
+        return f"{b/1_048_576:.1f} MB"
+    if b >= 1024:                             # 1 KB = 1024 Bytes
+        return f"{b/1024:.1f} KB"
+    return f"{b} B"
+    # Die Unterstriche in 1_073_741_824 sind nur zur Lesbarkeit (Python ignoriert sie).
+
+==============================================================================
+
+# ── HINTERGRUND-THREADS ───────────────────────────────────────────────────────
+
+# Ein Thread ist ein paralleler Ausführungsstrang im Programm.
+# Das Hauptprogramm (Flask) läuft in einem Thread.
+# details_loop und monitor_loop laufen je in einem eigenen Thread.
+# Alle drei laufen gleichzeitig, ohne sich gegenseitig zu blockieren.
+
+def details_loop():
+    """
+    Läuft in einem eigenen Thread.
+    Fragt alle 30 Sekunden die Details (CPU, RAM, Interfaces, Benutzer usw.)
+    von allen MikroTik- und OPNsense-Geräten ab.
+    Schreibt das Ergebnis in die globale Variable "device_details".
+    """
+
+    global device_details
+
+    while True:
+        # "while True" = Endlosschleife. Läuft, bis das Programm beendet wird.
+
+        all_devices = []
+        for layer in ('top_layer', 'middle_layer', 'bottom_layer', 'processing_layer'):
+            all_devices.extend(config['devices'].get(layer, []))
+        # Sammelt alle Geräte aus allen vier Layern in einer flachen Liste.
+        # .extend() hängt alle Elemente einer Liste an eine andere an
+        # (im Unterschied zu .append(), das die Liste selbst als ein Element anhängt).
+
+        queryable = [d for d in all_devices if d.get('type') in ('mikrotik', 'opnsense')]
+        # List Comprehension: Erstellt eine neue Liste, die nur Geräte enthält,
+        # deren "type" entweder "mikrotik" oder "opnsense" ist.
+        # Geräte mit type="none" (pfSense, Terminalserver) werden übersprungen.
+
+        temp = {}
+        # Temporäres Dictionary für die neuen Ergebnisse.
+        # Wir schreiben zuerst in "temp" und ersetzen am Ende device_details auf einmal.
+        # Das verhindert, dass der Browser halbfertige Daten bekommt, während
+        # die Abfrage noch läuft.
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            # Erstellt einen Pool mit bis zu 12 parallelen Threads.
+            # "with" stellt sicher, dass der Pool am Ende sauber beendet wird.
+
+            futures = {}
+            for dev in queryable:
+                if dev['type'] == 'mikrotik':
+                    futures[pool.submit(query_mikrotik, dev)] = dev['id']
+                elif dev['type'] == 'opnsense':
+                    futures[pool.submit(query_opnsense, dev)] = dev['id']
+            # pool.submit(funktion, argument) startet die Funktion in einem Thread
+            # und gibt sofort ein "Future"-Objekt zurück (Versprechen auf ein Ergebnis).
+            # futures[future] = dev['id'] merkt sich, welche Geräte-ID zu welchem
+            # Future gehört.
+
+            for future in as_completed(futures):
+                # as_completed() liefert Futures in der Reihenfolge, in der sie fertig werden.
+                # Wir warten also nicht auf jedes Gerät einzeln nacheinander, sondern
+                # verarbeiten die Ergebnisse so schnell wie möglich.
+
+                dev_id = futures[future]
+                try:
+                    temp[dev_id] = future.result()
+                    # future.result() gibt das Ergebnis der Funktion zurück
+                    # (also das Dictionary von query_mikrotik/query_opnsense).
+                except Exception as e:
+                    temp[dev_id] = {'error': str(e)}
+                    # Falls der Thread mit einer unerwarteten Exception abgestürzt ist,
+                    # speichern wir die Fehlermeldung.
+
+        device_details = temp
+        # Ergebnisse aus temp in die globale Variable übernehmen.
+        # Dieser Austausch ist in Python atomar (unteilbar) – der Browser bekommt
+        # immer entweder den alten oder den neuen Stand, nie einen Mix.
+
+        time.sleep(DETAILS_INTERVAL)
+        # 30 Sekunden warten, dann den gesamten Ablauf wiederholen.
+
+
+def monitor_loop():
+    """
+    Läuft in einem eigenen Thread.
+    Pingt alle 5 Sekunden alle Geräte an – primäre IP und ggf. Alt-IP.
+    Schreibt Erreichbarkeit und Latenz in "device_status" und "device_ping".
+    """
+
+    global device_status, device_ping
+
+    while True:
+        all_devices = []
+        for layer in ('top_layer', 'middle_layer', 'bottom_layer', 'processing_layer'):
+            all_devices.extend(config['devices'].get(layer, []))
+
+        tasks = []
+        for dev in all_devices:
+            tasks.append((dev['id'], 'primary', dev['ip']))
+            # Primäre IP: immer pingen
+
+            alt = get_alt_ip(dev['ip'])
+            if alt:
+                tasks.append((dev['id'], 'alt', alt))
+            # Alternative IP: nur für NatcoSwitches (10.20.x.x → 10.10.x.x)
+        # tasks ist jetzt eine Liste von Tupeln:
+        # [("cz", "primary", "10.20.4.2"), ("cz", "alt", "10.10.4.2"),
+        #  ("sk", "primary", "10.20.5.2"), ("sk", "alt", "10.10.5.2"), ...]
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=max(len(tasks), 1)) as pool:
+            # max(len(tasks), 1) stellt sicher, dass der Pool mindestens 1 Worker hat,
+            # auch wenn tasks leer ist (z.B. beim ersten Start).
+
+            futures = {
+                pool.submit(ping_host_with_latency, ip): (dev_id, kind, ip)
+                for dev_id, kind, ip in tasks
+            }
+            # Dictionary Comprehension: Erstellt für jeden Task ein Future.
+            # Alle Pings laufen gleichzeitig in parallelen Threads.
+
+            for future in as_completed(futures):
+                dev_id, kind, ip = futures[future]
+                # Entpackt das Tupel: dev_id="cz", kind="primary", ip="10.20.4.2"
+
+                reachable, latency = future.result()
+                # Ergebnis aus ping_host_with_latency: z.B. (True, 22.5)
+
+                if dev_id not in results:
+                    results[dev_id] = {}
+                # Legt einen neuen Dictionary-Eintrag an, wenn das Gerät noch nicht
+                # in results ist.
+
+                results[dev_id][kind] = {
+                    'ip':        ip,
+                    'reachable': reachable,
+                    'latency':   latency,
+                }
+                # Speichert das Ergebnis unter "primary" oder "alt".
+
+        device_status = {
+            dev_id: ('up' if data.get('primary', {}).get('reachable', False) else 'down')
+            for dev_id, data in results.items()
+        }
+        # Leitet den einfachen up/down-Status aus den Ping-Ergebnissen ab.
+        # Nur die primäre IP entscheidet über "up" oder "down" auf der Hauptansicht.
+        # Dictionary Comprehension: Baut das Dictionary in einer Zeile.
+
+        device_ping = results
+        # Alle detaillierten Ping-Daten (inkl. Alt-IP und Latenz) speichern.
+
+        time.sleep(config['settings']['ping_interval'])
+        # 5 Sekunden warten.
+
+==============================================================================
+
+# ── FLASK-ROUTEN (API-Endpunkte) ──────────────────────────────────────────────
+
+# Eine "Route" ist eine URL, auf die der Browser zugreifen kann.
+# Flask ruft für jede Route eine Python-Funktion auf und schickt deren
+# Rückgabewert als HTTP-Antwort zurück.
+
+@app.route('/')
+def index():
+    return render_template('index.html', config=config)
+# URL: http://server:5000/
+# Gibt die Hauptseite zurück (HTML).
+# render_template lädt templates/index.html und ersetzt {{ config|tojson }}
+# durch den JSON-String der config-Variable.
+
+@app.route('/api/status')
+def get_status():
+    return jsonify(device_status)
+# URL: http://server:5000/api/status
+# Gibt den aktuellen Ping-Status aller Geräte als JSON zurück.
+# Beispiel: {"cz": "up", "me": "down", "ben1": "up", ...}
+# Wird vom Browser alle 2 Sekunden abgerufen.
+
+@app.route('/api/details')
+def get_details():
+    return jsonify(device_details)
+# URL: http://server:5000/api/details
+# Gibt alle Detail-Daten zurück.
+# Wird vom Browser alle 30 Sekunden abgerufen.
+
+@app.route('/api/ping')
+def get_ping():
+    return jsonify(device_ping)
+# URL: http://server:5000/api/ping
+# Gibt Latenz und Erreichbarkeit für alle IPs zurück (inkl. Alt-IPs).
+# Wird vom Browser alle 5 Sekunden abgerufen.
+
+==============================================================================
+
+# ── PROGRAMMSTART ─────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    # Dieser Block wird nur ausgeführt, wenn die Datei direkt gestartet wird:
+    #   python app.py
+    # Nicht wenn sie von einem anderen Modul importiert wird.
+
+    load_config()
+    # config.json laden.
+
+    threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=details_loop,  daemon=True).start()
+    # Beide Hintergrund-Threads starten.
+    # daemon=True bedeutet: Wenn das Hauptprogramm beendet wird (z.B. Ctrl+C),
+    # werden diese Threads automatisch mitbeendet. Ohne "daemon=True" würde das
+    # Programm nach Ctrl+C weiterlaufen bis alle Threads fertig sind.
+
+    print("Starte Benslab Monitor...")
+    app.run(host='0.0.0.0', port=5000, debug=False)
+    # Startet den Flask-Webserver.
+    # host='0.0.0.0' = auf allen Netzwerkinterfaces lauschen (erreichbar von außen)
+    # port=5000      = TCP-Port 5000
+    # debug=False    = kein Debug-Modus (würde automatisch neu starten bei Änderungen,
+    #                  aber auch interne Fehler im Browser anzeigen – Sicherheitsrisiko)
+
+
+================================================================================
+  DATEI: templates/index.html  (Frontend)
+================================================================================
+
+Die HTML-Datei ist die Benutzeroberfläche. Sie wird einmal vom Server geladen
+und läuft dann vollständig im Browser. JavaScript übernimmt dabei die gesamte
+Dynamik: Polling, Aktualisierung der Anzeige, Modal-Fenster.
+
+Das Design verwendet:
+  - HTML:       Struktur der Seite
+  - CSS:        Aussehen (Farben, Abstände, Animationen)
+  - JavaScript: Verhalten (Daten laden, Anzeige aktualisieren)
+
+Das visuelle Thema ist "Telekom Magenta" mit einem Glasmorphismus-Stil
+(transparente Kacheln mit Blur-Effekt).
+
+==============================================================================
+
+<!DOCTYPE html>
+<!-- Teilt dem Browser mit, dass dies modernes HTML5 ist. -->
+
+<html lang="de">
+<!-- lang="de" sagt dem Browser und Screenreadern, dass der Inhalt Deutsch ist. -->
+
+<head>
+    <meta charset="UTF-8">
+    <!-- UTF-8: Zeichenkodierung, die alle Sonderzeichen (ä, ö, ü, €, ...) unterstützt. -->
+
+    <title>Benslab Monitor</title>
+    <!-- Titel im Browser-Tab -->
+
+    <style>
+        /* ── CSS: CUSTOM PROPERTIES (Variablen) ─────────────────────────── */
+        :root {
+            --magenta:        #E20074;
+            /* Telekom-Magenta. :root = das <html>-Element = global gültig. */
+            --text-primary:   rgba(255, 255, 255, 0.92);
+            /* Fast weißer Text (92% Deckkraft, leicht transparent für Soft-Look) */
+            --text-secondary: rgba(255, 255, 255, 0.50);
+            /* Halbtransparenter Text für weniger wichtige Infos */
+            --glass-tile:     rgba(255, 255, 255, 0.07);
+            /* Sehr transparentes Weiß für den Glaseffekt der Kacheln */
+            --glass-border:   rgba(255, 255, 255, 0.16);
+            /* Heller Rand für Glas-Optik */
+        }
+        /* Mit "var(--magenta)" kann man diese Werte überall im CSS verwenden.
+           Ändert man einen Wert hier, ändert er sich überall auf einmal. */
+
+        /* ── HINTERGRUND ─────────────────────────────────────────────────── */
+        body {
+            background: linear-gradient(150deg, #12010c 0%, #1c0214 35%, ...);
+            /* Diagonaler Farbverlauf von sehr dunklem Lila zu fast Schwarz. */
+            overflow: hidden;
+            /* Kein Scrollen – die Ansicht füllt immer genau den Bildschirm. */
+            width: 100vw; height: 100vh;
+            /* vw = viewport width (100% der Bildschirmbreite)
+               vh = viewport height (100% der Bildschirmhöhe) */
+        }
+
+        body::before { /* Telekom-T-Kachelmuster als SVG-Hintergrundbild */
+            content: '';
+            /* ::before und ::after sind "Pseudo-Elemente": Sie fügen virtuelle
+               HTML-Elemente vor/nach dem Inhalt ein, ohne das HTML zu ändern.
+               content: '' ist Pflicht, damit das Element erscheint. */
+            background-image: url("data:image/svg+xml,...");
+            /* data: URI = Bild direkt im CSS eingebettet (kein separater Datei-Download).
+               Das SVG zeichnet das Telekom-T-Symbol. */
+            pointer-events: none;
+            /* Das Pseudo-Element soll keine Maus-Klicks abfangen – es ist rein dekorativ. */
+            position: fixed; inset: 0;
+            /* inset: 0 = top/right/bottom/left alle 0 = füllt den gesamten Bildschirm. */
+        }
+
+        /* ── GERÄTE-KACHELN ──────────────────────────────────────────────── */
+        .device-node {
+            position: absolute;
+            /* Absolute Positionierung: Wir setzen x/y-Koordinaten per JavaScript. */
+            backdrop-filter: blur(10px) saturate(1.5) brightness(1.15);
+            /* Glasmorphismus: alles hinter der Kachel wird unscharf (blur),
+               gesättigter und heller gemacht. Nur in modernen Browsern. */
+            transition: all 0.35s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            /* Beim Hover animiert die Kachel sanft (0.35 Sekunden).
+               cubic-bezier ist eine mathematische Kurve für die Beschleunigung:
+               langsam starten, schnell werden, langsam enden (Ease-in-out). */
+        }
+
+        .device-node.status-up {
+            border-color: rgba(74, 222, 128, 0.30);
+            /* Grüner Rand wenn das Gerät erreichbar ist. */
+        }
+
+        .device-node.status-down {
+            animation: glowDown 2s infinite alternate;
+            /* Pulsierendes rotes Glühen für ausgefallene Geräte. */
+        }
+
+        @keyframes glowDown {
+            from { box-shadow: 0 0 12px rgba(248,80,80,0.20); }
+            to   { box-shadow: 0 0 28px rgba(248,80,80,0.38); }
+        }
+        /* @keyframes definiert eine Animation: von "from" bis "to", dann zurück
+           (alternate). "infinite" = unendlich wiederholen.
+           Das erzeugt ein pulsierendes Leuchten. */
+
+        /* ── LED-FARBEN ───────────────────────────────────────────────────── */
+        .tunnel-led.up   { background: #4ade80; box-shadow: 0 0 7px rgba(74,222,128,0.65); }
+        .tunnel-led.warn { background: #facc15; box-shadow: 0 0 7px rgba(250,204,21,0.65); }
+        .tunnel-led.down { background: #f87171; box-shadow: 0 0 7px rgba(248,113,113,0.65); }
+        /* Drei LED-Zustände für Tunnel und Ping-Anzeigen:
+           grün (up) = alles gut
+           gelb (warn) = erhöhte Latenz (30–100ms)
+           rot (down) = nicht erreichbar oder sehr hohe Latenz (>100ms) */
+
+        .node-eoip-dot.up   { background: #4ade80; box-shadow: 0 0 6px ...; }
+        .node-eoip-dot.warn { background: #facc15; box-shadow: 0 0 6px ...; }
+        .node-eoip-dot.down { background: #f87171; box-shadow: 0 0 6px ...; }
+        /* Gleiche Farben, aber für die Mini-LEDs auf den Kacheln (kleiner: 7px). */
+
+        /* ── TABS IM MODAL ───────────────────────────────────────────────── */
+        .modal-tabs { display: flex; border-bottom: 1px solid rgba(255,255,255,0.10); }
+        /* Die Tab-Leiste ist ein flexibler Container (Elemente nebeneinander). */
+
+        .tab-btn {
+            border-bottom: 2px solid transparent;
+            /* Beim inaktiven Tab: unsichtbarer unterer Rand (Platzhalter). */
+            margin-bottom: -1px;
+            /* Zieht den Button 1px nach unten, damit sein aktiver Rand die
+               Trennlinie der .modal-tabs überdeckt (visueller Trick). */
+        }
+
+        .tab-btn.active {
+            color: var(--magenta);
+            border-bottom-color: var(--magenta);
+            /* Aktiver Tab: Magenta-Farbe und Unterstrich. */
+        }
+
+        .tab-pane { display: none; }
+        .tab-pane.active { display: block; }
+        /* Alle Tab-Inhalte sind standardmäßig versteckt (display: none).
+           Nur der aktive bekommt display: block und ist sichtbar. */
+
+    </style>
+</head>
+
+<body>
+
+    <!-- ── HAUPTPANEL ──────────────────────────────────────────────────────── -->
+    <div class="main-panel">
+        <!-- Das große halbtransparente Glasfenster mit abgerundeten Ecken,
+             das den gesamten Inhalt umschließt. -->
+
+        <!-- Layer-Labels -->
+        <div class="layer-label" style="top: 95px;">Firewalls</div>
+        <div class="layer-label" style="top: 245px;">Core</div>
+        <div class="layer-label" style="top: 395px;">Sites</div>
+        <div class="layer-label" style="top: 545px;">Processing</div>
+        <!-- Beschriftungen links, fest auf der Y-Achse positioniert.
+             Die Y-Werte entsprechen den layout-Werten im JavaScript. -->
+    </div>
+
+    <!-- ── ALERT-BEREICH ───────────────────────────────────────────────────── -->
+    <div id="alertContainer"></div>
+    <!-- Wird nur sichtbar wenn Geräte ausgefallen sind.
+         JavaScript füllt diesen Container mit Fehlermeldungen. -->
+
+    <!-- ── DETAIL-MODAL ────────────────────────────────────────────────────── -->
+    <div id="detailModal" class="modal-overlay">
+        <!-- Das Modal ist standardmäßig unsichtbar (display: none in CSS).
+             Beim Klick auf eine Kachel wird die Klasse "active" hinzugefügt. -->
+        <div class="modal-content">
+            <div class="close-btn" onclick="closeModal()">✕</div>
+            <!-- onclick: Direkt beim Klick die JavaScript-Funktion closeModal() aufrufen. -->
+            <h2 id="modalTitle" class="modal-title">Device Name</h2>
+            <div id="modalBody" class="modal-body"></div>
+            <!-- modalBody: Hier wird der Inhalt per JavaScript eingefügt. -->
+        </div>
+    </div>
+
+    <!-- ── CANVAS & DEVICE-LAYER ───────────────────────────────────────────── -->
+    <canvas id="networkCanvas"></canvas>
+    <!-- Das Canvas ist eine Zeichenfläche für die Verbindungslinien zwischen
+         den Geräten. Mit JavaScript zeichnen wir darauf (2D-Kontext). -->
+
+    <div id="deviceLayer"></div>
+    <!-- In diesen Container werden die Geräte-Kacheln per JavaScript eingefügt. -->
+
+    <script>
+        /* ── INITIALISIERUNG ─────────────────────────────────────────────── */
+
+        const config = {{ config|tojson }};
+        /* Jinja2-Template-Syntax: {{ ... }} wird vom Flask-Server ersetzt.
+           config|tojson wandelt das Python-Dictionary in einen JSON-String um.
+           Das Ergebnis im Browser sieht so aus:
+             const config = {"settings": {...}, "devices": {...}};
+           Der Browser kennt jetzt die gesamte Gerätekonfiguration, ohne
+           einen eigenen API-Aufruf machen zu müssen. */
+
+        const canvas = document.getElementById('networkCanvas');
+        const ctx = canvas.getContext('2d');
+        /* Holt das Canvas-Element und erstellt den 2D-Zeichenkontext.
+           ctx ist das Objekt mit allen Zeichenfunktionen (beginPath, moveTo, ...) */
+
+        let devices = {};
+        /* Globales Objekt, das für jedes Gerät seine Position, Status und
+           DOM-Element speichert. Wird beim Zeichnen der Verbindungslinien verwendet. */
+
+        let pingData = {};
+        /* Aktuellste Ping-Daten von /api/ping. Wird alle 5 Sekunden aktualisiert. */
+
+        let detailsData = {};
+        /* Aktuellste Detail-Daten von /api/details. Wird alle 30 Sekunden aktualisiert. */
+
+        const natcoIds = new Set(config.devices.bottom_layer.map(d => d.id));
+        /* Erstellt ein Set mit allen IDs der NatcoSwitches (bottom_layer).
+           .map(d => d.id) erzeugt eine Liste der IDs: ["cz","sk","pl","gr","me","mk","hr","at"]
+           new Set(...) macht daraus ein Set für schnelles Nachschlagen.
+           Zweck: Wir prüfen später "natcoIds.has(devId)" um zu entscheiden,
+           ob ein Gerät ein NatcoSwitch ist. */
+
+        const layout = { topY: 160, midY: 310, botY: 460, procY: 610 };
+        /* Y-Koordinaten (in Pixel vom Fenster-Rand) für die vier Geräte-Reihen.
+           Firewalls: 160px, Core: 310px, Sites: 460px, Processing: 610px */
+
+        /* ── ZEIT-ANZEIGE ────────────────────────────────────────────────── */
+        function updateTime() {
+            const now = new Date();
+            /* new Date() = aktuelles Datum und Uhrzeit des Browsers. */
+
+            const t = now.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const d = now.toLocaleDateString('de-DE', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+            /* toLocaleTimeString/toLocaleDateString formatiert Datum/Zeit nach
+               deutschen Konventionen, z.B. "Di, 25. Feb. 2026  ·  14:32:08" */
+
+            document.getElementById('timeDisplay').textContent = `${d}  ·  ${t}`;
+            /* Setzt den Text des Elements mit id="timeDisplay". */
+        }
+        setInterval(updateTime, 1000);
+        /* setInterval(funktion, ms) ruft updateTime() alle 1000ms (= 1 Sekunde) auf. */
+        updateTime();
+        /* Sofortiger erster Aufruf, damit die Zeit nicht 1 Sekunde leer ist. */
+
+        /* ── CANVAS-GRÖßE ────────────────────────────────────────────────── */
+        function resizeCanvas() {
+            canvas.width  = window.innerWidth;
+            canvas.height = window.innerHeight;
+            /* Das Canvas muss immer die Größe des Fensters haben.
+               Bei Fenster-Größenänderung wird resizeCanvas() neu aufgerufen. */
+            renderDevices();
+            /* Geräte neu positionieren (x-Koordinaten hängen von der Fensterbreite ab). */
+        }
+        window.addEventListener('resize', resizeCanvas);
+        /* Immer wenn der Benutzer das Fenster in der Größe ändert, neu rendern. */
+
+        /* ── PING-LED FARBE ──────────────────────────────────────────────── */
+        function pingLedClass(latency, reachable) {
+            /*
+             * Gibt die CSS-Klasse für die Ping-LED zurück:
+             *   'up'   = grün  ≤ 30ms    (gute Verbindung durch WireGuard-Tunnel)
+             *   'warn' = gelb  31–100ms  (erhöhte, aber akzeptable Latenz)
+             *   'down' = rot   >100ms oder nicht erreichbar
+             *   ''     = grau  (keine Daten)
+             *
+             * Schwellwerte sind auf WireGuard-Tunnel ausgelegt:
+             * Ein gut konfigurierter WG-Tunnel hat typischerweise 10–50ms Latenz.
+             * Über 100ms deutet auf ein Problem hin (Überlast, schlechte Route).
+             */
+            if (!reachable) return 'down';
+            if (latency === null || latency === undefined) return '';
+            if (latency <= 30)  return 'up';
+            if (latency <= 100) return 'warn';
+            return 'down';
+        }
+
+        /* ── GERÄTE-KACHELN ERSTELLEN ────────────────────────────────────── */
+        let nodeIndex = 0;
+        function createDeviceElement(dev, x, y, isBottom) {
+            /*
+             * Erstellt oder aktualisiert eine Geräte-Kachel im #deviceLayer.
+             * dev      = Geräteobjekt aus config.json
+             * x, y     = Koordinaten in Pixel
+             * isBottom = true für NatcoSwitches (bottom_layer) – bekommen Extra-LEDs
+             */
+
+            let el = document.getElementById(dev.id);
+            if (!el) {
+                /* Element existiert noch nicht → neu erstellen. */
+                el = document.createElement('div');
+                el.className = 'device-node status-pending';
+                el.id = dev.id;
+                el.style.animationDelay = (nodeIndex * 0.08) + 's';
+                /* Jede Kachel erscheint 80ms später als die vorherige (Staffel-Effekt). */
+                nodeIndex++;
+
+                if (dev.type && dev.type !== 'none') {
+                    el.classList.add('clickable');
+                    el.addEventListener('click', () => openModal(dev.id));
+                    /* Klick-Event: Öffnet das Detail-Modal für dieses Gerät.
+                       () => openModal(dev.id) ist eine Arrow Function (modernes JS).
+                       Sie übergibt dev.id als Argument an openModal(). */
+                }
+                deviceLayer.appendChild(el);
+                /* Hängt das neue Element in den #deviceLayer. */
+            }
+
+            el.style.left = (x - 72) + 'px';
+            el.style.top  = (y - 35) + 'px';
+            /* Positioniert die Kachel. -72 und -35 zentrieren sie um x,y
+               (halbe Kachelbreite / halbe Kachelhöhe). */
+
+            const eoipHtml = isBottom ? `
+                <div class="node-eoip">
+                    <!-- Prod-LED: Status des Produktions-EoIP-Tunnels -->
+                    <div class="node-eoip-item">
+                        <div class="node-eoip-dot" id="eoip-prod-${dev.id}"></div>
+                        <span class="node-eoip-label">Prod</span>
+                    </div>
+                    <!-- Pre-LED: Status des PreProd-EoIP-Tunnels -->
+                    <div class="node-eoip-item">
+                        <div class="node-eoip-dot" id="eoip-pre-${dev.id}"></div>
+                        <span class="node-eoip-label">Pre</span>
+                    </div>
+                    <!-- Ping-LED: Latenz-Status über WireGuard-Tunnel -->
+                    <div class="node-eoip-item">
+                        <div class="node-eoip-dot" id="ping-tile-led-${dev.id}"></div>
+                        <span class="node-eoip-label" id="ping-tile-ms-${dev.id}">—</span>
+                    </div>
+                </div>` : '';
+            /* Template-Literal (Backticks): Mehrzeiliger String mit eingebetteten
+               Ausdrücken ${...}. Wird nur für NatcoSwitches (isBottom=true) gesetzt. */
+
+            el.innerHTML = `
+                <div class="status-indicator"></div>
+                <div class="device-name">${dev.name}</div>
+                <div class="device-ip">${dev.ip}</div>
+                ${eoipHtml}
+            `;
+            /* innerHTML ersetzt den gesamten Inhalt der Kachel.
+               Das ist nötig, damit Positions-Updates die IDs der LEDs korrekt setzen. */
+
+            if (!devices[dev.id]) {
+                devices[dev.id] = { x, y, el, id: dev.id, status: 'pending',
+                                    name: dev.name, type: dev.type, ip: dev.ip };
+            } else {
+                devices[dev.id].x = x;
+                devices[dev.id].y = y;
+            }
+            /* devices[] speichert Metadaten für die Canvas-Zeichnung (Verbindungslinien)
+               und für das Modal (Name, IP, Status). */
+        }
+
+        function renderDevices() {
+            const w = window.innerWidth;
+            const spread = (layer, y, isBottom) => layer.forEach((dev, i) =>
+                createDeviceElement(dev, (w / (layer.length + 1)) * (i + 1), y, isBottom));
+            /*
+             * spread() verteilt alle Geräte eines Layers gleichmäßig über die Breite.
+             * Formel: x = (Fensterbreite / (Anzahl+1)) * (Position+1)
+             * Beispiel: 8 NatcoSwitches, Fenster 1920px breit:
+             *   Abstand = 1920 / 9 = 213px
+             *   x[0] = 213, x[1] = 426, x[2] = 639, ..., x[7] = 1706
+             * +1 am Ende und beim Divisor stellt sicher, dass links und rechts
+             * gleich viel Rand bleibt.
+             */
+            spread(config.devices.top_layer,        layout.topY);
+            spread(config.devices.middle_layer,     layout.midY);
+            spread(config.devices.bottom_layer,     layout.botY, true);  // isBottom=true
+            spread(config.devices.processing_layer, layout.procY);
+        }
+
+        /* ── API-POLLING ─────────────────────────────────────────────────── */
+
+        async function refreshDetails() {
+            /*
+             * async function: Eine asynchrone Funktion. Sie pausiert an "await"-
+             * Stellen und gibt die Kontrolle an den Browser zurück, ohne die
+             * Seite einzufrieren. Das ist wichtig, damit die Animationen
+             * weiterlaufen während auf den Server gewartet wird.
+             */
+            try {
+                const res = await fetch('/api/details');
+                /* fetch() sendet eine HTTP-Anfrage. await wartet auf die Antwort. */
+                detailsData = await res.json();
+                /* res.json() parst den JSON-Text der Antwort in ein JavaScript-Objekt. */
+                config.devices.bottom_layer.forEach(dev => updateNodeEoip(dev.id));
+                /* Für alle NatcoSwitches die EoIP-LEDs aktualisieren. */
+            } catch(e) { console.warn('Details fetch error', e); }
+            /* try/catch: Bei Netzwerktfehlern (Server nicht erreichbar) nur warnen,
+               nicht abstürzen. console.warn gibt eine Warnung in der Browser-Konsole. */
+        }
+        setInterval(refreshDetails, 30000);  /* Alle 30 Sekunden */
+        refreshDetails();                     /* Sofort beim Start */
+
+        async function refreshPing() {
+            try {
+                const res = await fetch('/api/ping');
+                pingData = await res.json();
+                config.devices.bottom_layer.forEach(dev => updatePingTileLed(dev.id));
+                /* Ping-LEDs auf den NatcoSwitch-Kacheln aktualisieren. */
+            } catch(e) { console.warn('Ping fetch error', e); }
+        }
+        setInterval(refreshPing, 5000);   /* Alle 5 Sekunden */
+        refreshPing();
+
+        /* ── PING-LED AUF KACHELN AKTUALISIEREN ──────────────────────────── */
+        function updatePingTileLed(devId) {
+            const pd = pingData[devId];
+            const led = document.getElementById(`ping-tile-led-${devId}`);
+            const ms  = document.getElementById(`ping-tile-ms-${devId}`);
+            if (!led || !ms) return;
+            /* Falls die Elemente nicht existieren (z.B. noch nicht gerendert), abbrechen. */
+
+            const p = pd && pd.primary;
+            /* pd.primary = Ping-Daten der primären IP (10.20.x.x).
+               Der "&&"-Operator gibt den rechten Wert zurück wenn links truthy ist,
+               sonst undefined/null. Schutz gegen pd = undefined. */
+
+            const cls = p ? pingLedClass(p.latency, p.reachable) : '';
+            led.className = 'node-eoip-dot' + (cls ? ' ' + cls : '');
+            /* Setzt die CSS-Klasse des LED-Elements. Beispiele:
+               'node-eoip-dot up'   → grüne LED
+               'node-eoip-dot warn' → gelbe LED
+               'node-eoip-dot down' → rote LED
+               'node-eoip-dot'      → graue LED (keine Daten) */
+
+            ms.textContent = (p && p.reachable && p.latency !== null)
+                ? p.latency + 'ms'
+                : (p && !p.reachable ? 'off' : '—');
+            /* Ternärer Operator: Bedingung ? "wenn-wahr" : "wenn-falsch"
+               Zeigt die Latenz in ms (z.B. "22.5ms"), "off" wenn nicht erreichbar,
+               oder "—" wenn noch keine Daten vorliegen. */
+        }
+
+        /* ── EOIP-LEDs AUF KACHELN AKTUALISIEREN ─────────────────────────── */
+        function updateNodeEoip(devId) {
+            const d = detailsData[devId];
+            /* d = Detail-Daten dieses Geräts. Falls noch nicht geladen: undefined. */
+
+            const prodDot = document.getElementById(`eoip-prod-${devId}`);
+            const preDot  = document.getElementById(`eoip-pre-${devId}`);
+            if (!prodDot || !preDot) return;
+
+            let prodStatus = null, preStatus = null;
+
+            if (d && d.eoip && d.eoip.length > 0) {
+                d.eoip.forEach(t => {
+                    const name = t.name.toLowerCase();
+                    if (name.includes('preprod') || name.includes('pre-prod') || name.includes('pre_prod')) {
+                        preStatus = t.status;
+                    } else if (name.includes('prod')) {
+                        prodStatus = t.status;
+                    }
+                });
+                /* Zuordnung per Namen: Enthält der Tunnel-Name "preprod" oder Ähnliches,
+                   ist es der PreProd-Tunnel. Enthält er nur "prod", ist es der Prod-Tunnel.
+                   Die Prüfung auf "preprod" muss VOR "prod" kommen, da "preprod"
+                   auch "prod" enthält (Teilstring). */
+
+                if (prodStatus === null && preStatus === null) {
+                    prodStatus = d.eoip[0] ? d.eoip[0].status : null;
+                    preStatus  = d.eoip[1] ? d.eoip[1].status : null;
+                }
+                /* Fallback: Falls keine Namen übereinstimmen (unerwartete Benennung),
+                   nehmen wir einfach den ersten Tunnel als Prod und den zweiten als Pre. */
+            }
+
+            prodDot.className = 'node-eoip-dot' + (prodStatus ? ' ' + prodStatus : '');
+            preDot.className  = 'node-eoip-dot' + (preStatus  ? ' ' + preStatus  : '');
+        }
+
+        /* ── HILFSFUNKTIONEN FÜR MODAL-INHALT ───────────────────────────── */
+
+        function progressClass(pct) {
+            if (pct >= 85) return 'crit';   /* Kritisch: ≥ 85% belegt → roter Balken */
+            if (pct >= 60) return 'warn';   /* Warnung:  ≥ 60% belegt → gelber Balken */
+            return 'ok';                     /* Normal:   < 60% belegt → grüner Balken */
+        }
+
+        function infoRow(label, valueHtml) {
+            /* Erzeugt eine Zeile mit Label und Wert im Modal.
+               Beispiel: infoRow('IP-Adresse', '10.20.4.2')
+               →  ┌─────────────────────────────┐
+                  │ IP-ADRESSE          10.20.4.2│
+                  └─────────────────────────────┘ */
+            return `<div class="info-row">
+                        <span class="info-label">${label}</span>
+                        <span class="info-value">${valueHtml}</span>
+                    </div>`;
+        }
+
+        function progressRow(label, pct) {
+            /* Erzeugt eine Zeile mit Fortschrittsbalken (für CPU und RAM).
+               Beispiel: progressRow('CPU', 45) erzeugt:
+               ┌────────────────────────────┐
+               │ CPU                     45%│
+               │ ████████░░░░░░░░░░░░░░░░░ │
+               └────────────────────────────┘ */
+            const cls = progressClass(pct);
+            return `<div class="info-row" style="flex-direction:column;...">
+                        <div>...<span class="info-value">${pct}%</span></div>
+                        <div class="progress-bar">
+                            <div class="progress-fill ${cls}" style="width:${pct}%"></div>
+                        </div>
+                    </div>`;
+            /* style="width:${pct}%" setzt die Balkenbreite direkt.
+               Die CSS-Klasse (ok/warn/crit) bestimmt die Farbe. */
+        }
+
+        function tunnelRow(item, remoteKey) {
+            /* Erzeugt eine Zeile für WireGuard- oder EoIP-Tunnel mit LED.
+               item = Tunnelobjekt {name, status, endpoint/remote}
+               remoteKey = der Schlüssel für die Remote-Adresse ('endpoint' oder 'remote') */
+            return `<div class="info-row tunnel-row">
+                        <span class="tunnel-led ${item.status}"></span>
+                        <span class="tunnel-name">${item.name}</span>
+                        <span class="tunnel-endpoint">${item[remoteKey] || '—'}</span>
+                    </div>`;
+            /* item[remoteKey] = dynamischer Zugriff auf Objekteigenschaften:
+               item['endpoint'] oder item['remote'] */
+        }
+
+        /* ── PING-SEKTION (NUR NATCOSWITCHES) ───────────────────────────── */
+        function pingSection(devId) {
+            /*
+             * Erzeugt die Ping-Sektion im Detail-Modal für NatcoSwitches.
+             * Zeigt zwei Zeilen: primäre IP (10.20.x.x) und alternative IP (10.10.x.x)
+             * jeweils mit LED-Farbe und exakter Latenz in ms.
+             */
+            const pd = pingData[devId];
+            let h = `<div class="modal-section-title">Ping (WireGuard Tunnel)</div>`;
+
+            if (!pd) {
+                h += `<div class="loading-hint">Ping-Daten werden geladen…</div>`;
+                return h;
+            }
+
+            const makeRow = (label, info) => {
+                /* info = {ip, reachable, latency} für eine IP */
+                if (!info) return '';
+                const cls = pingLedClass(info.latency, info.reachable);
+                const msText = (info.reachable && info.latency !== null)
+                    ? `<strong>${info.latency} ms</strong>`
+                    : `<strong style="color:#f87171">nicht erreichbar</strong>`;
+                return `<div class="info-row tunnel-row">
+                            <span class="tunnel-led ${cls}"></span>
+                            <span class="tunnel-name">${label}</span>
+                            <span class="tunnel-endpoint">${info.ip}&nbsp;&nbsp;${msText}</span>
+                        </div>`;
+            };
+
+            h += makeRow('10.20.x.x (primär)',      pd.primary);
+            h += makeRow('10.10.x.x (alternativ)',  pd.alt);
+            return h;
+        }
+
+        /* ── BENUTZER-SEKTION ────────────────────────────────────────────── */
+        function usersSection(d) {
+            /*
+             * Erzeugt die Benutzer-Liste im "Benutzer"-Tab.
+             * d = Detail-Daten des Geräts (enthält d.users[])
+             * Für jeden Benutzer wird angezeigt: Name, Gruppe, SSH-Key-Status
+             */
+            if (!d) return `<div class="loading-hint">Details werden geladen…</div>`;
+            if (!d.users || d.users.length === 0)
+                return `<div class="loading-hint">Keine Benutzerdaten verfügbar.</div>`;
+
+            let h = `<div class="modal-section-title">Benutzer (${d.users.length})</div>`;
+            d.users.forEach(u => {
+                const keyBadge = u.has_ssh_key
+                    ? `<span class="user-key-badge has-key">🔑 Key hinterlegt</span>`
+                    : `<span class="user-key-badge no-key">kein Key</span>`;
+                h += `<div class="user-row">
+                          <span class="user-name">${u.name}</span>
+                          <span class="user-group">${u.group || '—'}</span>
+                          ${keyBadge}
+                      </div>`;
+            });
+            return h;
+        }
+
+        /* ── TAB-SYSTEM ──────────────────────────────────────────────────── */
+        function switchTab(btn, tabId) {
+            /*
+             * Wechselt zum angegebenen Tab.
+             * btn   = das geklickte Tab-Button-Element (wird übergeben via onclick="switchTab(this,...)")
+             * tabId = ID des Ziel-Tabs (z.B. 'details' oder 'benutzer')
+             */
+            const body = document.getElementById('modalBody');
+            body.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            body.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+            /* querySelectorAll gibt ALLE Elemente mit der CSS-Klasse zurück.
+               forEach iteriert darüber. classList.remove entfernt 'active'. */
+            btn.classList.add('active');
+            const pane = document.getElementById('mtab-' + tabId);
+            if (pane) pane.classList.add('active');
+            /* Setzt den angeklickten Button und den zugehörigen Inhalt auf 'active'. */
+        }
+
+        function buildTabbedModal(tabs) {
+            /*
+             * Baut das komplette Tab-HTML für das Modal.
+             * tabs = Array von Objekten: [{id: 'details', label: 'Details', content: '...'}, ...]
+             *
+             * Ergebnis:
+             *   <div class="modal-tabs">
+             *     <button class="tab-btn active" onclick="switchTab(this,'details')">Details</button>
+             *     <button class="tab-btn" onclick="switchTab(this,'benutzer')">Benutzer</button>
+             *   </div>
+             *   <div class="tab-pane active" id="mtab-details">...Details-Inhalt...</div>
+             *   <div class="tab-pane" id="mtab-benutzer">...User-Inhalt...</div>
+             */
+            const btnHtml = tabs.map((t, i) =>
+                `<button class="tab-btn ${i === 0 ? 'active' : ''}"
+                         onclick="switchTab(this, '${t.id}')">${t.label}</button>`
+            ).join('');
+            /* .map() erzeugt ein Array von Strings, .join('') verbindet sie ohne Trennzeichen. */
+
+            const paneHtml = tabs.map((t, i) =>
+                `<div class="tab-pane ${i === 0 ? 'active' : ''}" id="mtab-${t.id}">${t.content}</div>`
+            ).join('');
+
+            return `<div class="modal-tabs">${btnHtml}</div>${paneHtml}`;
+        }
+
+        /* ── MODAL ÖFFNEN ────────────────────────────────────────────────── */
+        function openModal(devId) {
+            /*
+             * Öffnet das Detail-Modal für ein Gerät.
+             * Für MikroTik-Geräte: Tab-System (Details + Benutzer)
+             * Für OPNsense: keine Tabs (kein Benutzer-Tab)
+             */
+            const dev = devices[devId];
+            if (!dev || dev.type === 'none') return;
+            /* Kein Modal für type='none'-Geräte (pfSense, Terminalserver). */
+
+            modalTitle.innerText = dev.name;
+            const st = dev.status ? dev.status.toUpperCase() : 'PENDING';
+            const stColor = (st === 'UP') ? '#16a34a' : '#dc2626';
+            /* Grüne Farbe für UP, rote für DOWN/PENDING. */
+
+            const headerHtml = infoRow('IP-Adresse', dev.ip)
+                             + infoRow('Status', `<span style="color:${stColor}">${st}</span>`);
+            /* Header ist für alle Gerättypen gleich: IP und Status. */
+
+            const d = detailsData[devId];
+            const isNatco = natcoIds.has(devId);
+
+            if (dev.type === 'mikrotik') {
+                let detailsHtml = headerHtml;
+
+                if (!d) {
+                    detailsHtml += `<div class="loading-hint">Details werden geladen…</div>`;
+                    /* Erster Aufruf: Details noch nicht geladen (details_loop braucht bis zu 30s). */
+                } else if (d.error && d.cpu === null) {
+                    detailsHtml += `<div class="api-error">Fehler: ${d.error}</div>`;
+                    /* Totalausfall: d.cpu === null bedeutet nicht mal die Grunddaten wurden geladen. */
+                } else {
+                    detailsHtml += systemSection(d);    /* CPU, RAM, Uptime */
+
+                    if (isNatco) {
+                        detailsHtml += pingSection(devId); /* Ping für beide IPs */
+                    }
+
+                    detailsHtml += interfacesSection(d.interfaces);
+
+                    if (d.wireguard && d.wireguard.length > 0) {
+                        detailsHtml += `<div class="modal-section-title">WireGuard Peers</div>`;
+                        d.wireguard.forEach(p => { detailsHtml += tunnelRow(p, 'endpoint'); });
+                    }
+
+                    if (d.eoip && d.eoip.length > 0) {
+                        detailsHtml += `<div class="modal-section-title">EoIP Tunnel</div>`;
+                        d.eoip.forEach(t => { detailsHtml += tunnelRow(t, 'remote'); });
+                    }
+
+                    if (d.error) {
+                        detailsHtml += `<div class="api-error">Teilfehler: ${d.error}</div>`;
+                        /* Teilfehler: Grunddaten OK, aber z.B. WireGuard nicht abfragbar. */
+                    }
+                }
+
+                const usersHtml = usersSection(d);
+
+                modalBody.innerHTML = buildTabbedModal([
+                    { id: 'details',  label: 'Details',  content: detailsHtml },
+                    { id: 'benutzer', label: 'Benutzer', content: usersHtml  },
+                ]);
+                /* Baut das Tab-Modal und setzt es als innerHTML. */
+
+            } else if (dev.type === 'opnsense') {
+                /* OPNsense: kein Tab-System, kein Benutzer-Tab.
+                   WireGuard-Peers werden nach Interface-Nummer gruppiert (wg4–wg11). */
+                let html = headerHtml;
+                /* ... (Aufbau analog, aber ohne Tabs und ohne Benutzer) ... */
+                modalBody.innerHTML = html;
+            }
+
+            modal.classList.add('active');
+            /* Setzt das Modal auf sichtbar (CSS: .modal-overlay.active { display: flex; }) */
+        }
+
+        function closeModal() { modal.classList.remove('active'); }
+        /* Schließt das Modal, indem die 'active'-Klasse entfernt wird. */
+
+        window.onclick = function(e) { if (e.target === modal) closeModal(); };
+        /* Klick auf den Overlay-Hintergrund (außerhalb des Modal-Fensters) schließt das Modal.
+           e.target === modal prüft, ob das Klick-Ziel die Overlay-Fläche selbst ist,
+           nicht ein Element darin. */
+
+        /* ── VERBINDUNGSLINIEN & PARTIKEL ────────────────────────────────── */
+        function drawLine(d1, d2) {
+            /*
+             * Zeichnet eine Linie zwischen zwei Geräten auf dem Canvas.
+             * d1, d2 = Geräte-IDs (z.B. 'ben1', 'opn1')
+             * Rote Linie wenn eines der Geräte "down" ist, sonst Magenta.
+             *
+             * 3% Wahrscheinlichkeit: Ein Partikel wird auf der Linie gestartet,
+             * der von d1 nach d2 fliegt (animiert den Datenfluss).
+             */
+            if (!devices[d1] || !devices[d2]) return;
+            const a = devices[d1], b = devices[d2];
+            const isError = (a.status === 'down' || b.status === 'down');
+
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.strokeStyle = isError ? 'rgba(248,80,80,0.45)' : 'rgba(226,0,116,0.28)';
+            ctx.lineWidth   = isError ? 2.5 : 1.6;
+            ctx.stroke();
+            /* Canvas-Zeichenroutine: beginPath startet einen neuen Pfad,
+               moveTo setzt den Startpunkt, lineTo den Endpunkt, stroke zeichnet die Linie. */
+
+            if (Math.random() < 0.03) {
+                particles.push({ sx: a.x, sy: a.y, ex: b.x, ey: b.y,
+                                  progress: 0, speed: 0.008 + Math.random() * 0.012, ... });
+            }
+            /* Math.random() gibt eine Zufallszahl 0.0–1.0 zurück.
+               < 0.03 = 3% Wahrscheinlichkeit pro Frame.
+               Bei ~60 Frames/Sekunde erscheint etwa 1–2 Partikel pro Sekunde. */
+        }
+
+        function animate() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            /* Canvas leeren bevor neu gezeichnet wird. */
+
+            /* Alle Verbindungen zeichnen: */
+            drawLine('opn1', 'opn2');     /* Firewalls untereinander */
+            drawLine('ben1', 'opn1');     /* Core → Firewall */
+            config.devices.bottom_layer.forEach(sw => {
+                drawLine(sw.id, 'ben1');  /* Jeder NatcoSwitch → beide Core-Switches */
+                drawLine(sw.id, 'ben2');
+            });
+            /* ... weitere Verbindungen ... */
+
+            /* Partikel bewegen und zeichnen: */
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.progress += p.speed;
+                /* progress geht von 0 (Startpunkt) bis 1 (Endpunkt). */
+                ctx.arc(p.sx + (p.ex - p.sx) * p.progress,
+                        p.sy + (p.ey - p.sy) * p.progress,
+                        p.size, 0, Math.PI * 2);
+                /* Lineare Interpolation: position = start + (end - start) * progress */
+                ctx.fill();
+                if (p.progress >= 1) particles.splice(i, 1);
+                /* Partikel entfernen wenn sie am Ziel angekommen sind.
+                   Rückwärts iterieren (i--) damit splice() den Index nicht verschiebt. */
+            }
+            requestAnimationFrame(animate);
+            /* requestAnimationFrame ruft animate() beim nächsten Browser-Repaint auf
+               (normalerweise 60 Mal pro Sekunde). Das ist effizienter als setInterval,
+               weil der Browser es mit dem Bildschirm-Refresh synchronisiert. */
+        }
+
+        /* ── STATUS-POLLING ──────────────────────────────────────────────── */
+        async function updateStatus() {
+            /*
+             * Fragt alle 2 Sekunden /api/status ab.
+             * Aktualisiert die Kachel-Farben (grüner/roter Rand).
+             * Zeigt den Alert-Banner wenn Geräte ausgefallen sind.
+             */
+            try {
+                const res = await fetch('/api/status');
+                const statusData = await res.json();
+                /* statusData = {"cz": "up", "me": "down", ...} */
+
+                const downList = [];
+                for (const [id, state] of Object.entries(statusData)) {
+                    /* Object.entries() gibt [[id, state], ...] zurück.
+                       Destructuring: [id, state] entpackt das innere Array. */
+                    if (!devices[id]) continue;
+                    devices[id].status = state;
+
+                    const el = devices[id].el;
+                    el.classList.remove('status-pending', 'status-up', 'status-down');
+                    el.classList.add(state === 'up' ? 'status-up' : 'status-down');
+                    /* CSS-Klasse tauschen → Kachelfarbe ändert sich sofort. */
+
+                    if (state === 'down') downList.push(devices[id].name);
+                }
+
+                if (downList.length > 0) {
+                    alertContainer.style.display = 'block';
+                    alertContainer.innerHTML = `<div class="alert-glass">${
+                        downList.map(n => `<div class="alert-item">${n} nicht erreichbar</div>`).join('')
+                    }</div>`;
+                } else {
+                    alertContainer.style.display = 'none';
+                    /* Kein Alert wenn alle Geräte erreichbar. */
+                }
+            } catch(e) { console.error('Status fetch error', e); }
+        }
+
+        /* ── PROGRAMMSTART ───────────────────────────────────────────────── */
+        resizeCanvas();          /* Canvas auf Fenstergröße setzen + Geräte rendern */
+        animate();               /* Animations-Loop starten */
+        setInterval(updateStatus, 2000);   /* Status alle 2 Sekunden pollen */
+
+    </script>
+</body>
+</html>
+
+
+================================================================================
+  DATENFLUSS: Wie alles zusammenspielt
+================================================================================
+
+  Browser                    Flask-Server (app.py)
+  ───────                    ─────────────────────
+
+  Beim Laden:
+  GET /         ──────────►  render_template('index.html', config=config)
+                ◄──────────  HTML mit eingebetteter Konfiguration
+
+  Alle 2 Sek.:
+  GET /api/status ─────────►  return jsonify(device_status)
+                 ◄─────────  {"cz":"up","me":"down",...}
+                              ↑ befüllt von monitor_loop (Thread 1)
+
+  Alle 5 Sek.:
+  GET /api/ping ───────────►  return jsonify(device_ping)
+                ◄───────────  {"cz":{"primary":{...},"alt":{...}},...}
+                               ↑ befüllt von monitor_loop (Thread 1)
+
+  Alle 30 Sek.:
+  GET /api/details ────────►  return jsonify(device_details)
+                  ◄────────  {"cz":{"cpu":12,"ram_used_pct":45,"users":[...],...}}
+                               ↑ befüllt von details_loop (Thread 2)
+
+  Thread 1 (monitor_loop):    Pingt alle IPs parallel → device_status + device_ping
+  Thread 2 (details_loop):    Fragt RouterOS/OPNsense-APIs parallel ab → device_details
+  Hauptthread (Flask):        Beantwortet HTTP-Anfragen vom Browser
+
+
+================================================================================
+  DATEISTRUKTUR
+================================================================================
+
+  /opt/blm1/
+  ├── app.py                  Python-Backend (dieser Code, dokumentiert oben)
+  ├── config.json             Gerätekonfiguration
+  ├── requirements.txt        Python-Abhängigkeiten (flask, requests, librouteros, ...)
+  ├── start.sh                Startskript (ruft venv/bin/python app.py auf)
+  ├── doku.txt                Diese Dokumentation
+  ├── templates/
+  │   └── index.html          Frontend (HTML/CSS/JavaScript, dokumentiert oben)
+  └── venv/                   Python Virtual Environment
+      └── bin/python          Python-Interpreter mit allen Abhängigkeiten
+
+
+================================================================================
+  INSTALLATION & BETRIEB
+================================================================================
+
+  Abhängigkeiten installieren (einmalig):
+    cd /opt/blm1
+    python3 -m venv venv
+    venv/bin/pip install -r requirements.txt
+
+  Manuell starten:
+    ./start.sh
+    oder: venv/bin/python app.py
+
+  Als systemd-Service:
+    sudo tee /etc/systemd/system/blm1.service > /dev/null << 'EOF'
+    [Unit]
+    Description=Benslab Monitor
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=mathias
+    WorkingDirectory=/opt/blm1
+    ExecStart=/opt/blm1/venv/bin/python app.py
+    Restart=on-failure
+    RestartSec=5
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now blm1
+
+  Logs ansehen:
+    sudo journalctl -u blm1 -f
+
+  Weboberfläche:
+    http://serverip:5000
+
+================================================================================
