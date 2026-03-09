@@ -658,6 +658,7 @@
             gap: .4rem;
             justify-content: center;
         }
+        /* Informational node (no click) */
         .topo-node {
             background: var(--card2);
             border: 1px solid var(--border);
@@ -671,6 +672,44 @@
         }
         .topo-node.up   { border-color: rgba(34,197,94,.35); }
         .topo-node.down { border-color: rgba(239,68,68,.35); }
+        /* Clickable topology tile */
+        .topo-tile {
+            background: var(--card2);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: .38rem .75rem;
+            font-size: .78rem;
+            display: flex;
+            align-items: center;
+            gap: .4rem;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: border-color .15s, background .15s, box-shadow .15s;
+            user-select: none;
+        }
+        .topo-tile:hover  { background: var(--card); border-color: var(--border2); }
+        .topo-tile.up     { border-color: rgba(34,197,94,.35); }
+        .topo-tile.up:hover { border-color: rgba(34,197,94,.65); }
+        .topo-tile.down   { border-color: rgba(239,68,68,.35); }
+        .topo-tile.down:hover { border-color: rgba(239,68,68,.65); }
+        .topo-tile-active {
+            border-color: var(--magenta) !important;
+            background: rgba(226,0,116,.08) !important;
+            box-shadow: 0 0 10px rgba(226,0,116,.18);
+        }
+        .topo-tile-name { font-weight: 600; }
+        .topo-tile-sub  { opacity: .45; font-size: .68rem; }
+        /* Title bar inside center card */
+        .topo-center-title {
+            display: flex;
+            align-items: center;
+            gap: .5rem;
+            font-weight: 700;
+            font-size: .9rem;
+            margin-bottom: .55rem;
+            padding-bottom: .45rem;
+            border-bottom: 1px solid var(--border);
+        }
         .topo-dot {
             width: 7px; height: 7px;
             border-radius: 50%;
@@ -1267,6 +1306,8 @@ function makeHalfGauge(canvasId, pct, color) {
 function openModal(devId) {
     const dev = allDevices.find(d => d.id === devId);
     if (!dev || dev.type === 'none') return;
+    // OPNsense gets the interactive topology modal
+    if (dev.type === 'opnsense') { openTopoModal(devId); return; }
     destroyModalCharts();
 
     const st = deviceStatus[devId] || 'pending';
@@ -1326,109 +1367,11 @@ function openModal(devId) {
             { id: 'benutzer', label: 'Benutzer', content: usersSection(d) },
         ]);
 
-    } else if (dev.type === 'opnsense') {
-
-        // Switches that list this OPNsense as their uplink
-        const connectedSwitches = allDevices.filter(d => d.uplink === devId);
-
-        // ── North: WireGuard peers ──────────────────────────────
-        const wgPeers = d?.wireguard || [];
-        let northNodes = '';
-        if (wgPeers.length) {
-            wgPeers.forEach(p => {
-                const ep = (p.endpoint && p.endpoint !== '—') ? p.endpoint : '';
-                northNodes += `<div class="topo-node ${p.status}" title="${ep}">
-                    <span class="topo-dot ${p.status}"></span>
-                    <span>${p.name}</span>
-                    ${ep ? `<span class="topo-ep">${ep}</span>` : ''}
-                </div>`;
-            });
-        } else {
-            northNodes = `<span style="opacity:.4;font-size:.8rem">No WireGuard peers</span>`;
-        }
-
-        // ── Center: OPNsense metrics ────────────────────────────
-        let centerMetrics = '';
-        if (!d) {
-            centerMetrics = `<div class="loading-hint">Details loading…</div>`;
-        } else if (d.error && d.cpu === null) {
-            centerMetrics = `<div class="api-error">Error: ${d.error}</div>`;
-        } else {
-            centerMetrics += infoRow('IP', dev.ip);
-            if (d.uptime)  centerMetrics += infoRow('Uptime',   d.uptime);
-            if (d.loadavg) centerMetrics += infoRow('Load Avg', d.loadavg);
-            if (d.fw_states !== null && d.fw_states !== undefined) {
-                const lim = d.fw_limit
-                    ? ` / ${Number(d.fw_limit).toLocaleString('de')} max` : '';
-                centerMetrics += infoRow('FW States',
-                    `${Number(d.fw_states).toLocaleString('de')}${lim}`);
-            }
-            // Collapsible interface list
-            if (d.interfaces?.length) {
-                const upCount = d.interfaces.filter(i => i.status === 'up').length;
-                const uid = 'topo-ifaces-' + devId;
-                centerMetrics += `
-                    <span class="topo-ifaces-toggle" onclick="
-                        const b=document.getElementById('${uid}');
-                        const a=this.querySelector('.arr');
-                        b.style.display=b.style.display==='none'?'block':'none';
-                        a.textContent=b.style.display==='none'?'▸':'▾';
-                    ">
-                        <span class="arr">▸</span>
-                        Interfaces (${upCount}/${d.interfaces.length} up)
-                    </span>
-                    <div id="${uid}" style="display:none" class="topo-ifaces-body">
-                        ${d.interfaces.map(i => interfaceRow(i)).join('')}
-                    </div>`;
-            }
-            if (d.error) centerMetrics += `<div class="api-error" style="margin-top:.5rem">Partial error: ${d.error}</div>`;
-        }
-
-        // ── South: connected switches ───────────────────────────
-        let southNodes = '';
-        if (connectedSwitches.length) {
-            connectedSwitches.forEach(sw => {
-                const swSt = deviceStatus[sw.id] || 'pending';
-                const swD  = detailsData[sw.id];
-                const cpuTxt = swD?.cpu !== null && swD?.cpu !== undefined
-                    ? `<span style="opacity:.5;font-size:.68rem">CPU ${swD.cpu}%</span>` : '';
-                southNodes += `<div class="topo-node ${swSt}" title="${sw.ip}">
-                    <span class="topo-dot ${swSt}"></span>
-                    <span>${sw.name}</span>
-                    ${cpuTxt}
-                </div>`;
-            });
-        } else {
-            southNodes = `<span style="opacity:.4;font-size:.8rem">No connected switches configured</span>`;
-        }
-
-        // ── Assemble topology layout ────────────────────────────
-        const topoHtml = `
-            <div class="topo-view">
-                <div class="topo-layer">
-                    <div class="topo-layer-label">▲ WireGuard Partners</div>
-                    <div class="topo-nodes">${northNodes}</div>
-                </div>
-                <div class="topo-connector"><div class="topo-vline"></div></div>
-                <div class="topo-center-card">
-                    ${gaugeHtml}
-                    <div style="margin-top:${gaugeHtml ? '.5rem' : '0'}">
-                        ${centerMetrics}
-                    </div>
-                </div>
-                <div class="topo-connector"><div class="topo-vline"></div></div>
-                <div class="topo-layer">
-                    <div class="topo-layer-label">▼ Connected Switches</div>
-                    <div class="topo-nodes">${southNodes}</div>
-                </div>
-            </div>`;
-
-        bodyEl.innerHTML = topoHtml;
     }
 
     document.getElementById('detailModal').classList.add('active');
 
-    // Gauges nach DOM-Aufbau erzeugen
+    // Render gauges after DOM is built
     if (d && d.cpu !== null && d.cpu !== undefined) {
         requestAnimationFrame(() => {
             _cpuChart = makeHalfGauge('mc-cpu', d.cpu, gaugeColor(d.cpu));
@@ -1442,6 +1385,258 @@ function closeModal() {
     destroyModalCharts();
 }
 window.onclick = e => { if (e.target.id === 'detailModal') closeModal(); };
+
+// =============================================================================
+// OPNsense topology modal
+// Three-tier layout: WG partners (north) | active device detail (center) | switches (south)
+// Clicking a tile swaps only the center panel without re-drawing north/south.
+// =============================================================================
+
+let _topo = null; // { opnId, centerType: 'opnsense'|'switch'|'wgpeer', centerKey }
+
+function openTopoModal(opnId) {
+    destroyModalCharts();
+    _topo = { opnId, centerType: 'opnsense', centerKey: opnId };
+
+    const opnDev = allDevices.find(d => d.id === opnId);
+    const opnSt  = deviceStatus[opnId] || 'pending';
+    document.getElementById('modalTitle').textContent = opnDev.name;
+    document.getElementById('modalDot').className = 'status-dot ' + opnSt;
+
+    _renderTopoShell();
+    document.getElementById('detailModal').classList.add('active');
+}
+
+// Build and inject the full topology HTML (north + center + south).
+function _renderTopoShell() {
+    const { opnId } = _topo;
+    const opnData = detailsData[opnId];
+    const wgPeers = opnData?.wireguard || [];
+    const switches = allDevices.filter(d => d.uplink === opnId);
+
+    // ── North tiles: WireGuard peers ─────────────────────────────────────────
+    let northHtml = '';
+    if (wgPeers.length) {
+        wgPeers.forEach((p, i) => {
+            const active = (_topo.centerType === 'wgpeer' && _topo.centerKey === i) ? 'topo-tile-active' : '';
+            const ep = (p.endpoint && p.endpoint !== '—') ? p.endpoint : '';
+            northHtml += `<div class="topo-tile ${p.status} ${active}"
+                id="topo-tile-wg${i}" onclick="_topoSelect('wgpeer',${i})">
+                <span class="topo-dot ${p.status}"></span>
+                <span class="topo-tile-name">${p.name}</span>
+                ${ep ? `<span class="topo-tile-sub">${ep}</span>` : ''}
+            </div>`;
+        });
+    } else {
+        northHtml = `<span style="opacity:.4;font-size:.8rem">No WireGuard peers</span>`;
+    }
+
+    // ── South tiles: connected switches ──────────────────────────────────────
+    let southHtml = '';
+    if (switches.length) {
+        switches.forEach(sw => {
+            const swSt = deviceStatus[sw.id] || 'pending';
+            const swD  = detailsData[sw.id];
+            const active = (_topo.centerType === 'switch' && _topo.centerKey === sw.id) ? 'topo-tile-active' : '';
+            const cpuTxt = (swD?.cpu !== null && swD?.cpu !== undefined)
+                ? `<span class="topo-tile-sub">CPU ${swD.cpu}%</span>` : '';
+            southHtml += `<div class="topo-tile ${swSt} ${active}"
+                id="topo-tile-${sw.id}" onclick="_topoSelect('switch','${sw.id}')">
+                <span class="topo-dot ${swSt}"></span>
+                <span class="topo-tile-name">${sw.name}</span>
+                ${cpuTxt}
+            </div>`;
+        });
+    } else {
+        southHtml = `<span style="opacity:.4;font-size:.8rem">No switches configured</span>`;
+    }
+
+    document.getElementById('modalBody').innerHTML = `
+        <div class="topo-view">
+            <div class="topo-layer">
+                <div class="topo-layer-label">▲ WireGuard Partners</div>
+                <div class="topo-nodes">${northHtml}</div>
+            </div>
+            <div class="topo-connector"><div class="topo-vline"></div></div>
+            <div id="topo-center"></div>
+            <div class="topo-connector"><div class="topo-vline"></div></div>
+            <div class="topo-layer">
+                <div class="topo-layer-label">▼ Connected Switches</div>
+                <div class="topo-nodes">${southHtml}</div>
+            </div>
+        </div>`;
+
+    _renderTopoCenter();
+}
+
+// Switch the center panel to a new device / WG peer.
+function _topoSelect(type, key) {
+    destroyModalCharts();
+    _topo.centerType = type;
+    _topo.centerKey  = key;
+    // Highlight the clicked tile, remove highlight from all others
+    document.querySelectorAll('.topo-tile').forEach(t => t.classList.remove('topo-tile-active'));
+    const tileEl = document.getElementById(type === 'wgpeer' ? `topo-tile-wg${key}` : `topo-tile-${key}`);
+    if (tileEl) tileEl.classList.add('topo-tile-active');
+    _renderTopoCenter();
+}
+
+// Re-render only the center panel based on current _topo state.
+function _renderTopoCenter() {
+    const { opnId, centerType, centerKey } = _topo;
+    const opnData = detailsData[opnId];
+    const wgPeers = opnData?.wireguard || [];
+    const centerEl = document.getElementById('topo-center');
+    if (!centerEl) return;
+
+    if (centerType === 'opnsense') {
+        centerEl.innerHTML = _buildOpnCenter(opnId, opnData);
+    } else if (centerType === 'switch') {
+        centerEl.innerHTML = _buildSwitchCenter(centerKey);
+    } else if (centerType === 'wgpeer') {
+        centerEl.innerHTML = _buildWgPeerCenter(wgPeers[centerKey]);
+    }
+    _renderTopoCenterGauges();
+}
+
+// ── Center builders ───────────────────────────────────────────────────────────
+
+function _buildOpnCenter(opnId, d) {
+    const dev = allDevices.find(x => x.id === opnId);
+    const st  = deviceStatus[opnId] || 'pending';
+
+    let html = `<div class="topo-center-card">`;
+    html += `<div class="topo-center-title">
+        <span class="topo-dot ${st}"></span>
+        <span>${dev.name}</span>
+        <span class="topo-tile-sub" style="margin-left:.3rem">${dev.ip}</span>
+    </div>`;
+
+    if (!d) {
+        html += `<div class="loading-hint">Details loading…</div>`;
+    } else if (d.error && d.cpu === null) {
+        html += `<div class="api-error">Error: ${d.error}</div>`;
+    } else {
+        // Gauges
+        if (d.cpu !== null && d.cpu !== undefined && d.ram_used_pct !== null) {
+            const sub = d.ram_free_mb !== null
+                ? `<div class="modal-gauge-sub">${d.ram_free_mb} MB free</div>` : '';
+            html += `<div class="modal-gauges">
+                <div class="modal-gauge-item">
+                    <canvas id="mc-cpu" width="110" height="62"></canvas>
+                    <div class="modal-gauge-val" style="color:${gaugeColor(d.cpu)}">${d.cpu}%</div>
+                    <div class="modal-gauge-lbl">CPU</div>
+                </div>
+                <div class="modal-gauge-item">
+                    <canvas id="mc-ram" width="110" height="62"></canvas>
+                    <div class="modal-gauge-val" style="color:${gaugeColor(d.ram_used_pct)}">${d.ram_used_pct}%</div>
+                    <div class="modal-gauge-lbl">RAM</div>${sub}
+                </div>
+            </div>`;
+        }
+        if (d.uptime)  html += infoRow('Uptime',   d.uptime);
+        if (d.loadavg) html += infoRow('Load Avg', d.loadavg);
+        if (d.fw_states !== null && d.fw_states !== undefined) {
+            const lim = d.fw_limit ? ` / ${Number(d.fw_limit).toLocaleString('de')} max` : '';
+            html += infoRow('FW States', `${Number(d.fw_states).toLocaleString('de')}${lim}`);
+        }
+        if (d.interfaces?.length) {
+            const upCount = d.interfaces.filter(i => i.status === 'up').length;
+            html += `<span class="topo-ifaces-toggle" onclick="
+                const b=document.getElementById('topo-if-opn');
+                const a=this.querySelector('.arr');
+                b.style.display=b.style.display==='none'?'block':'none';
+                a.textContent=b.style.display==='none'?'▸':'▾';
+            "><span class="arr">▸</span> Interfaces (${upCount}/${d.interfaces.length} up)</span>
+            <div id="topo-if-opn" style="display:none" class="topo-ifaces-body">
+                ${d.interfaces.map(i => interfaceRow(i)).join('')}
+            </div>`;
+        }
+        if (d.error) html += `<div class="api-error" style="margin-top:.5rem">Partial error: ${d.error}</div>`;
+    }
+    html += `</div>`;
+    return html;
+}
+
+function _buildSwitchCenter(swId) {
+    const dev = allDevices.find(x => x.id === swId);
+    const st  = deviceStatus[swId] || 'pending';
+    const d   = detailsData[swId];
+
+    let html = `<div class="topo-center-card">`;
+    html += `<div class="topo-center-title">
+        <span class="topo-dot ${st}"></span>
+        <span>${dev.name}</span>
+        <span class="topo-tile-sub" style="margin-left:.3rem">${dev.ip}</span>
+    </div>`;
+
+    if (!d) {
+        html += `<div class="loading-hint">Details loading…</div>`;
+    } else if (d.error && d.cpu === null) {
+        html += `<div class="api-error">Error: ${d.error}</div>`;
+    } else {
+        if (d.cpu !== null && d.cpu !== undefined && d.ram_used_pct !== null) {
+            const sub = d.ram_free_mb !== null
+                ? `<div class="modal-gauge-sub">${d.ram_free_mb} MB free</div>` : '';
+            html += `<div class="modal-gauges">
+                <div class="modal-gauge-item">
+                    <canvas id="mc-cpu" width="110" height="62"></canvas>
+                    <div class="modal-gauge-val" style="color:${gaugeColor(d.cpu)}">${d.cpu}%</div>
+                    <div class="modal-gauge-lbl">CPU</div>
+                </div>
+                <div class="modal-gauge-item">
+                    <canvas id="mc-ram" width="110" height="62"></canvas>
+                    <div class="modal-gauge-val" style="color:${gaugeColor(d.ram_used_pct)}">${d.ram_used_pct}%</div>
+                    <div class="modal-gauge-lbl">RAM</div>${sub}
+                </div>
+            </div>`;
+        }
+        if (d.uptime) html += infoRow('Uptime', d.uptime);
+        html += interfacesSection(d.interfaces);
+        if (d.wireguard?.length) {
+            html += `<div class="section-title">WireGuard</div>`;
+            d.wireguard.forEach(p => { html += tunnelRow(p, 'endpoint'); });
+        }
+        if (d.eoip?.length) {
+            html += `<div class="section-title">EoIP</div>`;
+            d.eoip.forEach(t => { html += tunnelRow(t, 'remote'); });
+        }
+        if (d.error) html += `<div class="api-error" style="margin-top:.5rem">Partial error: ${d.error}</div>`;
+    }
+    html += `</div>`;
+    return html;
+}
+
+function _buildWgPeerCenter(peer) {
+    if (!peer) return `<div class="topo-center-card"><div class="loading-hint">No peer data.</div></div>`;
+    const stColor = peer.status === 'up' ? 'var(--green)' : 'var(--red)';
+    let html = `<div class="topo-center-card">`;
+    html += `<div class="topo-center-title">
+        <span class="topo-dot ${peer.status}"></span>
+        <span>${peer.name}</span>
+    </div>`;
+    html += infoRow('Interface', peer.interface);
+    html += infoRow('Endpoint',  peer.endpoint !== '—' ? peer.endpoint : '—');
+    html += infoRow('Status',    `<span style="color:${stColor};font-weight:700">${peer.status.toUpperCase()}</span>`);
+    html += infoRow('Traffic ↓', peer.rx);
+    html += infoRow('Traffic ↑', peer.tx);
+    html += `</div>`;
+    return html;
+}
+
+// Render Chart.js half-gauges for the current center device (if applicable).
+function _renderTopoCenterGauges() {
+    const { centerType, centerKey, opnId } = _topo;
+    let d = null;
+    if (centerType === 'opnsense') d = detailsData[opnId];
+    else if (centerType === 'switch') d = detailsData[centerKey];
+    if (d?.cpu !== null && d?.cpu !== undefined) {
+        requestAnimationFrame(() => {
+            _cpuChart = makeHalfGauge('mc-cpu', d.cpu, gaugeColor(d.cpu));
+            _ramChart = makeHalfGauge('mc-ram', d.ram_used_pct ?? 0, gaugeColor(d.ram_used_pct ?? 0));
+        });
+    }
+}
 
 // ── Initialisierung ────────────────────────────────────────────
 initCards();
