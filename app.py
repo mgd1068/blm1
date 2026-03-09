@@ -137,6 +137,7 @@ def query_mikrotik(dev):
         'wireguard':    [],
         'eoip':         [],
         'interfaces':   [],
+        'bridges':      [],
         'users':        [],
         'error':        None,
     }
@@ -174,41 +175,33 @@ def query_mikrotik(dev):
         except (TrapError, FatalError):
             pass  # Device has no WireGuard configured – skip silently
 
-        # -- EoIP tunnels ----------------------------------------------------
-        try:
-            for tun in api.path('interface', 'eoip'):
-                running = tun.get('running', False)
-                if isinstance(running, str):
-                    running = running.lower() == 'true'
-                result['eoip'].append({
-                    'name':   tun.get('name', 'eoip'),
-                    'remote': tun.get('remote-address', '—'),
-                    'status': 'up' if running else 'down',
-                })
-        except (TrapError, FatalError):
-            pass  # No EoIP tunnels configured
-
-        # -- Physical interfaces ---------------------------------------------
+        # -- Interface map (single pass) -------------------------------------
+        # Build name→data dict so EoIP, bridge and physical interface sections
+        # can all look up rx/tx counters without extra API round-trips.
+        iface_map = {}
         try:
             for iface in api.path('interface'):
-                itype = iface.get('type', '')
-                if itype not in MIKROTIK_PHYS_TYPES:
-                    continue   # Skip logical/virtual interfaces
-                if iface.get('disabled', False):
-                    continue   # Skip administratively disabled ports
-                running = iface.get('running', False)
-                if isinstance(running, str):
-                    running = running.lower() == 'true'
-                result['interfaces'].append({
-                    'name':    iface.get('name', '?'),
-                    'comment': (iface.get('comment') or '').strip(),
-                    'status':  'up' if running else 'down',
-                    'speed':   '—',  # filled in by the ethernet detail query below
-                })
+                iface_map[iface.get('name', '')] = iface
         except (TrapError, FatalError):
             pass
 
-        # Enrich physical interfaces with negotiated link speed from ethernet table
+        # -- Physical interfaces (ether, sfp, combo …) ----------------------
+        for name, iface in iface_map.items():
+            if iface.get('type', '') not in MIKROTIK_PHYS_TYPES:
+                continue
+            if iface.get('disabled', False):
+                continue
+            running = iface.get('running', False)
+            if isinstance(running, str):
+                running = running.lower() == 'true'
+            result['interfaces'].append({
+                'name':    name,
+                'comment': (iface.get('comment') or '').strip(),
+                'status':  'up' if running else 'down',
+                'speed':   '—',
+            })
+
+        # Enrich physical interfaces with negotiated link speed
         try:
             speed_map = {}
             for eth in api.path('interface', 'ethernet'):
@@ -216,6 +209,73 @@ def query_mikrotik(dev):
             for iface in result['interfaces']:
                 if iface['name'] in speed_map:
                     iface['speed'] = speed_map[iface['name']] or '—'
+        except (TrapError, FatalError):
+            pass
+
+        # -- EoIP tunnels (config + traffic from iface_map) -----------------
+        try:
+            for tun in api.path('interface', 'eoip'):
+                name    = tun.get('name', 'eoip')
+                running = tun.get('running', False)
+                if isinstance(running, str):
+                    running = running.lower() == 'true'
+                stats = iface_map.get(name, {})
+                result['eoip'].append({
+                    'name':    name,
+                    'comment': (tun.get('comment') or '').strip(),
+                    'remote':  tun.get('remote-address', '—'),
+                    'status':  'up' if running else 'down',
+                    'rx_byte': _safe_int(stats.get('rx-byte')),
+                    'tx_byte': _safe_int(stats.get('tx-byte')),
+                })
+        except (TrapError, FatalError):
+            pass
+
+        # -- Bridges (with port membership and per-port traffic) ------------
+        try:
+            # Collect bridge port membership: bridge_name → [member_iface_name]
+            bridge_ports = {}
+            try:
+                for port in api.path('interface', 'bridge', 'port'):
+                    if port.get('disabled', False):
+                        continue
+                    bridge_ports.setdefault(
+                        port.get('bridge', ''), []
+                    ).append(port.get('interface', ''))
+            except (TrapError, FatalError):
+                pass
+
+            for br in api.path('interface', 'bridge'):
+                br_name = br.get('name', '')
+                running = br.get('running', False)
+                if isinstance(running, str):
+                    running = running.lower() == 'true'
+                stats = iface_map.get(br_name, {})
+
+                # Build member port list with type, status and traffic
+                ports = []
+                for port_name in bridge_ports.get(br_name, []):
+                    p = iface_map.get(port_name, {})
+                    p_run = p.get('running', False)
+                    if isinstance(p_run, str):
+                        p_run = p_run.lower() == 'true'
+                    ports.append({
+                        'name':    port_name,
+                        'comment': (p.get('comment') or '').strip(),
+                        'type':    p.get('type', 'unknown'),
+                        'status':  'up' if p_run else 'down',
+                        'rx_byte': _safe_int(p.get('rx-byte')),
+                        'tx_byte': _safe_int(p.get('tx-byte')),
+                    })
+
+                result['bridges'].append({
+                    'name':    br_name,
+                    'comment': (br.get('comment') or '').strip(),
+                    'status':  'up' if running else 'down',
+                    'rx_byte': _safe_int(stats.get('rx-byte')),
+                    'tx_byte': _safe_int(stats.get('tx-byte')),
+                    'ports':   ports,
+                })
         except (TrapError, FatalError):
             pass
 
@@ -445,6 +505,14 @@ def _parse_bsd_media(media):
     if mbps >= 1000:
         return f"{mbps // 1000} Gbps"
     return f"{mbps} Mbps"
+
+
+def _safe_int(v):
+    """Safely convert a value to int, returning 0 on failure."""
+    try:
+        return int(v or 0)
+    except (ValueError, TypeError):
+        return 0
 
 
 def _fmt_bytes(b):
